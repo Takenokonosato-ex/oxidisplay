@@ -14,9 +14,14 @@ pub const UDL_CMD_WRITERAW16: u8 = 0x68;
 pub const UDL_CMD_WRITERL16: u8 = 0x69;
 pub const UDL_CMD_WRITECOPY16: u8 = 0x6A;
 pub const UDL_CMD_WRITERLX16: u8 = 0x6B;
+pub const UDL_CMD_WRITECOMP8: u8 = 0x70;
+pub const UDL_CMD_WRITECOMP16: u8 = 0x78;
+pub const UDL_CMD_FLUSH_PIPE: u8 = 0xA0;
+pub const UDL_CMD_LOAD_DECOMP_TABLE: u8 = 0xE0;
 
 /// USB control transfer bRequest values (vendor-specific)
 pub const USB_REQ_I2C_READ: u8 = 0x02;
+pub const USB_REQ_GET_STATUS: u8 = 0x06;
 pub const USB_REQ_SET_CHANNEL: u8 = 0x12;
 
 /// USB vendor descriptor type for DisplayLink DL-1x5 capabilities.
@@ -32,6 +37,17 @@ pub const STD_CHANNEL_PAYLOAD: [u8; 16] = [
 pub const UDL_REG_COLORDEPTH: u8 = 0x00;
 pub const UDL_COLORDEPTH_16BPP: u8 = 0x00;
 pub const UDL_COLORDEPTH_24BPP: u8 = 0x01;
+pub const UDL_COLORDEPTH_16BPP_ALT: u8 = 0x08;
+pub const UDL_COLORDEPTH_24BPP_ALT: u8 = 0x09;
+
+/// Output color depth mode for DL-1x5 modeset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorDepth {
+    /// 16-bit RGB565 (`base16` only).
+    Bpp16,
+    /// 24-bit RGB888 (`base16` RGB565 upper bits + `base8` RGB323 lower bits).
+    Bpp24,
+}
 
 /// Display timing registers
 pub const UDL_REG_XDISPLAYSTART: u8 = 0x01;
@@ -51,13 +67,19 @@ pub const UDL_REG_PIXELCLOCK5KHZ: u8 = 0x1B;
 /// Blank / DPMS mode register
 pub const UDL_REG_BLANKMODE: u8 = 0x1F;
 
-/// Framebuffer base addresses (24-bit big-endian across 3 registers)
+/// Framebuffer base addresses and line strides (24-bit big-endian across 3 registers)
 pub const UDL_REG_BASE16BPP_ADDR2: u8 = 0x20;
 pub const UDL_REG_BASE16BPP_ADDR1: u8 = 0x21;
 pub const UDL_REG_BASE16BPP_ADDR0: u8 = 0x22;
+pub const UDL_REG_STRIDE16_ADDR2: u8 = 0x23;
+pub const UDL_REG_STRIDE16_ADDR1: u8 = 0x24;
+pub const UDL_REG_STRIDE16_ADDR0: u8 = 0x25;
 pub const UDL_REG_BASE8BPP_ADDR2: u8 = 0x26;
 pub const UDL_REG_BASE8BPP_ADDR1: u8 = 0x27;
 pub const UDL_REG_BASE8BPP_ADDR0: u8 = 0x28;
+pub const UDL_REG_STRIDE8_ADDR2: u8 = 0x29;
+pub const UDL_REG_STRIDE8_ADDR1: u8 = 0x2A;
+pub const UDL_REG_STRIDE8_ADDR0: u8 = 0x2B;
 
 /// Video register lock/unlock
 pub const UDL_REG_VIDREG: u8 = 0xFF;
@@ -235,17 +257,20 @@ fn emit_set_reg_lfsr16(buf: &mut Vec<u8>, reg: u8, count: u16) {
 }
 
 #[inline]
+fn emit_set_reg24_be(buf: &mut Vec<u8>, reg: u8, val: u32) {
+    emit_set_reg(buf, reg, ((val >> 16) & 0xFF) as u8);
+    emit_set_reg(buf, reg + 1, ((val >> 8) & 0xFF) as u8);
+    emit_set_reg(buf, reg + 2, (val & 0xFF) as u8);
+}
+
+#[inline]
 fn emit_set_base16bpp(buf: &mut Vec<u8>, base: u32) {
-    emit_set_reg(buf, UDL_REG_BASE16BPP_ADDR2, ((base >> 16) & 0xFF) as u8);
-    emit_set_reg(buf, UDL_REG_BASE16BPP_ADDR1, ((base >> 8) & 0xFF) as u8);
-    emit_set_reg(buf, UDL_REG_BASE16BPP_ADDR0, (base & 0xFF) as u8);
+    emit_set_reg24_be(buf, UDL_REG_BASE16BPP_ADDR2, base);
 }
 
 #[inline]
 fn emit_set_base8bpp(buf: &mut Vec<u8>, base: u32) {
-    emit_set_reg(buf, UDL_REG_BASE8BPP_ADDR2, ((base >> 16) & 0xFF) as u8);
-    emit_set_reg(buf, UDL_REG_BASE8BPP_ADDR1, ((base >> 8) & 0xFF) as u8);
-    emit_set_reg(buf, UDL_REG_BASE8BPP_ADDR0, (base & 0xFF) as u8);
+    emit_set_reg24_be(buf, UDL_REG_BASE8BPP_ADDR2, base);
 }
 
 /// Emit a 1-pixel no-op copy command required by DL-1x5 to latch/flush register changes.
@@ -263,6 +288,17 @@ pub fn emit_dummy_render(buf: &mut Vec<u8>) {
 /// Encode the complete bulk command sequence to configure a 16bpp RGB565 video mode
 /// and enable display output.
 pub fn encode_mode_set(mode: &VideoMode, buf: &mut Vec<u8>) {
+    encode_mode_set_with_depth(mode, ColorDepth::Bpp16, false, buf);
+}
+
+/// Encode the complete bulk command sequence to configure either a 16bpp or 24bpp video mode.
+/// `alt_depth_reg` should be set to `(status >> 24) & 1 != 0` from vendor control IN `0x06`.
+pub fn encode_mode_set_with_depth(
+    mode: &VideoMode,
+    depth: ColorDepth,
+    alt_depth_reg: bool,
+    buf: &mut Vec<u8>,
+) {
     let reg01 = mode.htotal.saturating_sub(mode.hsync_start);
     let reg03 = reg01.saturating_add(mode.hdisplay);
     let reg05 = mode.vtotal.saturating_sub(mode.vsync_start);
@@ -277,11 +313,21 @@ pub fn encode_mode_set(mode: &VideoMode, buf: &mut Vec<u8>) {
     let reg17 = mode.vdisplay;
     let reg1b = (mode.clock_khz / 5) as u16;
 
+    let color_val = match (depth, alt_depth_reg) {
+        (ColorDepth::Bpp16, false) => UDL_COLORDEPTH_16BPP,
+        (ColorDepth::Bpp24, false) => UDL_COLORDEPTH_24BPP,
+        (ColorDepth::Bpp16, true) => UDL_COLORDEPTH_16BPP_ALT,
+        (ColorDepth::Bpp24, true) => UDL_COLORDEPTH_24BPP_ALT,
+    };
+    let base8 = 2 * mode.hdisplay as u32 * mode.vdisplay as u32;
+
     // Lock video registers before programming
     emit_set_reg(buf, UDL_REG_VIDREG, UDL_VIDREG_LOCK);
-    emit_set_reg(buf, UDL_REG_COLORDEPTH, UDL_COLORDEPTH_16BPP);
+    emit_set_reg(buf, UDL_REG_COLORDEPTH, color_val);
     emit_set_base16bpp(buf, 0);
-    emit_set_base8bpp(buf, 2 * mode.hdisplay as u32 * mode.vdisplay as u32);
+    emit_set_reg24_be(buf, UDL_REG_STRIDE16_ADDR2, 2 * mode.hdisplay as u32);
+    emit_set_base8bpp(buf, base8);
+    emit_set_reg24_be(buf, UDL_REG_STRIDE8_ADDR2, mode.hdisplay as u32);
 
     emit_set_reg_lfsr16(buf, UDL_REG_XDISPLAYSTART, reg01);
     emit_set_reg_lfsr16(buf, UDL_REG_XDISPLAYEND, reg03);
@@ -301,6 +347,29 @@ pub fn encode_mode_set(mode: &VideoMode, buf: &mut Vec<u8>) {
     emit_set_reg(buf, UDL_REG_BLANKMODE, BlankMode::On as u8);
     emit_set_reg(buf, UDL_REG_VIDREG, UDL_VIDREG_UNLOCK);
     emit_dummy_render(buf);
+}
+
+/// Zero-fill the entire 8-bit `base8` plane (`base8..base8 + w*h`) using `WRITERL8` (`0xAF 0x61`)
+/// so enabling 24bpp mode starts with clean zero lower bits (~32 KB for 1280x800).
+pub fn encode_clear_base8(mode: &VideoMode, buf: &mut Vec<u8>) {
+    let total_px = mode.hdisplay as usize * mode.vdisplay as usize;
+    let base8 = (total_px * 2) as u32;
+    let mut offset = 0usize;
+    while offset < total_px {
+        let count = (total_px - offset).min(256);
+        let addr = base8 + offset as u32;
+        buf.extend_from_slice(&[
+            UDL_MSG_BULK,
+            UDL_CMD_WRITERL8,
+            ((addr >> 16) & 0xFF) as u8,
+            ((addr >> 8) & 0xFF) as u8,
+            (addr & 0xFF) as u8,
+            (count & 0xFF) as u8, // total_count (0 == 256)
+            (count & 0xFF) as u8, // run count (0 == 256)
+            0x00,                 // zero RGB323 lower bits
+        ]);
+        offset += count;
+    }
 }
 
 /// Encode the bulk command sequence to set the display blank / power state.

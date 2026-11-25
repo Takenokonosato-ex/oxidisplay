@@ -422,7 +422,7 @@ unsafe extern "system" fn evt_device_d0_entry(
                 gamma_support: IDDCX_FEATURE_IMPLEMENTATION_NONE,
                 _pad0: 0,
             },
-            static_desktop_reencode_frame_count: 2,
+            static_desktop_reencode_frame_count: 4,
             _pad1: 0,
         };
 

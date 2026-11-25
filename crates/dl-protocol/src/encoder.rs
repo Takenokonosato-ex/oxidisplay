@@ -7,7 +7,10 @@
 //!   scanlines) to keep motion locked near 60 FPS over USB 2.0.
 //! - The moment motion pauses, `refine_lossless` restores all degraded rows to bit-exact RGB565.
 
-use crate::regs::{UDL_CMD_WRITECOPY16, UDL_CMD_WRITERLX16, UDL_MSG_BULK};
+use crate::huffman::{encode_comp16_command, encode_comp8_command};
+use crate::regs::{
+    UDL_CMD_WRITECOPY16, UDL_CMD_WRITECOPY8, UDL_CMD_WRITERLX16, UDL_CMD_WRITERLX8, UDL_MSG_BULK,
+};
 
 /// USB 2.0 High-Speed bulk transfer chunk size (128 KiB - 512 B = 130,560 bytes, multiple of 512 B).
 /// Larger chunks halve per-IRP WDF/WinUSB completion overhead for higher sustained throughput.
@@ -15,8 +18,8 @@ pub const DEFAULT_USB_CHUNK_SIZE: usize = 128 * 1024 - 512;
 
 /// Minimum bytes needed in a chunk to emit a `WRITERLX16` command (7-byte header + 4-byte payload).
 const MIN_RLX_CMD_BYTES: usize = 11;
-/// Exact bytes needed for a `WRITECOPY16` command (2-byte prefix + 3 dst + 1 count + 3 src).
-const COPY16_CMD_BYTES: usize = 9;
+/// Exact bytes needed for a `WRITECOPY16` / `WRITECOPY8` command (2-byte prefix + 3 dst + 1 count + 3 src).
+const COPY_CMD_BYTES: usize = 9;
 /// Minimum unchanged pixel run length required before splitting a dirty scanline span.
 const MIN_UNCHANGED_GAP: usize = 6;
 /// Maximum pixels per DisplayLink command (0 on wire encodes 256).
@@ -122,6 +125,13 @@ impl ChunkSink for VecChunkSink {
 #[inline(always)]
 pub const fn bgra_to_rgb565(b: u8, g: u8, r: u8) -> u16 {
     (((r as u16) & 0xF8) << 8) | (((g as u16) & 0xFC) << 3) | ((b as u16) >> 3)
+}
+
+/// Pack the lower 3-2-3 bits of a BGRA8888 pixel into DL-1x5 `base8` `RGB323` format:
+/// `[R2 R1 R0 | G1 G0 | B2 B1 B0]` (verified against `libdlo` `DLO_RGB8`).
+#[inline(always)]
+pub const fn bgra_to_rgb323_low(b: u8, g: u8, r: u8) -> u8 {
+    ((r & 0x07) << 5) | ((g & 0x03) << 3) | (b & 0x07)
 }
 
 /// Fast row-wide BGRA8888 -> RGB565 conversion with runtime AVX2 / SSE2 acceleration on x86_64.
@@ -298,15 +308,24 @@ const fn rgb565_within_tolerance(a: u16, b: u16, tol: i32) -> bool {
 }
 
 /// Pre-allocated DisplayLink DL-1x5 frame encoder with shadow framebuffer diffing,
-/// adaptive motion quantization, and automatic lossless static refinement.
+/// adaptive motion quantization, optional hardware Huffman (`0xAF 0x78`), and
+/// automatic lossless static refinement (including optional 24-bit `base8` plane).
 pub struct FrameEncoder {
     width: u32,
     height: u32,
     shadow_fb: Vec<u16>,
     row_scratch: Vec<u16>,
-    /// Tracks which scanlines were quantized or skipped during motion and need lossless refinement.
+    /// Tracks which scanlines were quantized or skipped during motion and need lossless RGB565 refinement.
     row_degraded: Vec<bool>,
     degraded_row_count: usize,
+    /// Optional 24-bit lower-bits (`base8` `RGB323`) shadow plane & dirty-row tracking.
+    shadow_fb8: Vec<u8>,
+    row_scratch8: Vec<u8>,
+    row_base8_dirty: Vec<bool>,
+    base8_dirty_count: usize,
+    color_depth_24: bool,
+    /// Enable adaptive per-span hardware Huffman (`0xAF 0x78` / `0x70`) after uploading `0xAF 0xE0`.
+    huffman_enabled: bool,
     interlace_parity: usize,
     force_full_refresh: bool,
     dither: bool,
@@ -322,6 +341,12 @@ impl FrameEncoder {
             row_scratch: vec![0u16; width as usize],
             row_degraded: vec![false; height as usize],
             degraded_row_count: 0,
+            shadow_fb8: Vec::new(),
+            row_scratch8: Vec::new(),
+            row_base8_dirty: Vec::new(),
+            base8_dirty_count: 0,
+            color_depth_24: false,
+            huffman_enabled: false,
             interlace_parity: 0,
             force_full_refresh: true,
             dither: false,
@@ -342,6 +367,15 @@ impl FrameEncoder {
         self.row_degraded.clear();
         self.row_degraded.resize(height as usize, false);
         self.degraded_row_count = 0;
+        if self.color_depth_24 {
+            self.shadow_fb8.clear();
+            self.shadow_fb8.resize(count, 0);
+            self.row_scratch8.clear();
+            self.row_scratch8.resize(width as usize, 0);
+            self.row_base8_dirty.clear();
+            self.row_base8_dirty.resize(height as usize, true);
+            self.base8_dirty_count = height as usize;
+        }
         self.force_full_refresh = true;
     }
 
@@ -360,20 +394,68 @@ impl FrameEncoder {
         self.dither = enabled;
     }
 
+    /// Enable or disable adaptive per-span hardware Huffman (`0xAF 0x78` / `0x70`).
+    /// Call only after sending `encode_load_huffman_table` (`0xAF 0xE0`) to the device.
+    #[inline]
+    pub fn set_huffman_enabled(&mut self, enabled: bool) {
+        self.huffman_enabled = enabled;
+    }
+
+    #[inline]
+    pub fn huffman_enabled(&self) -> bool {
+        self.huffman_enabled
+    }
+
+    /// Enable or disable static 24-bit color refinement via the DL-1x5 `base8` (`RGB323`) plane.
+    /// Pre-allocates the 1-byte/pixel `shadow_fb8` buffer once so per-frame encoding stays zero-alloc.
+    pub fn set_color_depth_24(&mut self, enabled: bool) {
+        if self.color_depth_24 == enabled {
+            return;
+        }
+        self.color_depth_24 = enabled;
+        if enabled {
+            let count = (self.width as usize).saturating_mul(self.height as usize);
+            self.shadow_fb8.clear();
+            self.shadow_fb8.resize(count, 0);
+            self.row_scratch8.clear();
+            self.row_scratch8.resize(self.width as usize, 0);
+            self.row_base8_dirty.clear();
+            self.row_base8_dirty.resize(self.height as usize, true);
+            self.base8_dirty_count = self.height as usize;
+        } else {
+            self.base8_dirty_count = 0;
+        }
+    }
+
+    #[inline]
+    pub fn color_depth_24(&self) -> bool {
+        self.color_depth_24
+    }
+
     #[inline]
     pub fn invalidate_shadow(&mut self) {
         self.force_full_refresh = true;
+        if self.color_depth_24 {
+            self.shadow_fb8.fill(0);
+            self.row_base8_dirty.fill(true);
+            self.base8_dirty_count = self.height as usize;
+        }
     }
 
-    /// Returns true if any scanlines were quantized or interlaced during motion and await lossless restore.
+    /// Returns true if any scanlines await lossless RGB565 or static 24-bit `base8` refinement.
     #[inline]
     pub fn needs_refinement(&self) -> bool {
-        self.degraded_row_count > 0
+        self.degraded_row_count > 0 || (self.color_depth_24 && self.base8_dirty_count > 0)
     }
 
     #[inline]
     pub fn shadow_fb(&self) -> &[u16] {
         &self.shadow_fb
+    }
+
+    #[inline]
+    pub fn shadow_fb8(&self) -> &[u8] {
+        &self.shadow_fb8
     }
 
     /// Encode a frame at 100% lossless RGB565 (convenience wrapper).
@@ -415,18 +497,22 @@ impl FrameEncoder {
             return Ok(stats);
         }
 
-        let mut writer = ChunkWriter::new(sink);
+        let mut writer = ChunkWriter::new(sink, self.huffman_enabled);
 
-        // Idle / static refinement pass: restore degraded rows to lossless RGB565!
+        // Idle / static refinement pass:
+        // 1. Restore degraded RGB565 rows to 100% lossless first.
+        // 2. Once RGB565 is lossless, refine dirty 24-bit `base8` rows (`RGB323` lower bits).
         if !self.force_full_refresh && move_regions.is_empty() && dirty_rects.is_empty() {
             if self.degraded_row_count > 0 {
                 self.refine_degraded_rows(surface, stride_bytes, 420, &mut writer, &mut stats)?;
+            } else if self.color_depth_24 && self.base8_dirty_count > 0 {
+                self.refine_base8_rows(surface, stride_bytes, 420, &mut writer, &mut stats)?;
             }
             writer.finish(&mut stats)?;
             return Ok(stats);
         }
 
-        // 1. Hardware screen-to-screen blits (`WRITECOPY16`) for move regions.
+        // 1. Hardware screen-to-screen blits (`WRITECOPY16` + optional `WRITECOPY8`) for move regions.
         if !self.force_full_refresh && !move_regions.is_empty() {
             for mv in move_regions {
                 self.encode_move_region(*mv, &mut writer, &mut stats)?;
@@ -469,10 +555,16 @@ impl FrameEncoder {
             )?;
         }
 
-        // If we are back in Lossless mode and still have a few degraded rows left, opportunistically
-        // refine up to 200 rows alongside this frame.
-        if effective_tier == QualityTier::Lossless && !force && self.degraded_row_count > 0 {
-            self.refine_degraded_rows(surface, stride_bytes, 200, &mut writer, &mut stats)?;
+        // Opportunistic static refinement when back in Lossless mode with spare USB headroom.
+        if effective_tier == QualityTier::Lossless && !force {
+            if self.degraded_row_count > 0 {
+                self.refine_degraded_rows(surface, stride_bytes, 200, &mut writer, &mut stats)?;
+            } else if self.color_depth_24
+                && self.base8_dirty_count > 0
+                && stats.pixels_changed < 80_000
+            {
+                self.refine_base8_rows(surface, stride_bytes, 120, &mut writer, &mut stats)?;
+            }
         }
 
         self.force_full_refresh = false;
@@ -494,6 +586,93 @@ impl FrameEncoder {
             self.row_degraded[y] = false;
             self.degraded_row_count = self.degraded_row_count.saturating_sub(1);
         }
+    }
+
+    #[inline]
+    fn mark_row_base8_dirty(&mut self, y: usize) {
+        if self.color_depth_24 && !self.row_base8_dirty[y] {
+            self.row_base8_dirty[y] = true;
+            self.base8_dirty_count += 1;
+        }
+    }
+
+    #[inline]
+    fn clear_row_base8_dirty(&mut self, y: usize) {
+        if self.color_depth_24 && self.row_base8_dirty[y] {
+            self.row_base8_dirty[y] = false;
+            self.base8_dirty_count = self.base8_dirty_count.saturating_sub(1);
+        }
+    }
+
+    /// Upgrade up to `max_rows` dirty scanlines on the 8-bit `base8` (`RGB323`) plane
+    /// for full 24-bit color when motion settles (zero bandwidth penalty during motion!).
+    fn refine_base8_rows<S: ChunkSink>(
+        &mut self,
+        surface: &[u8],
+        stride_bytes: usize,
+        max_rows: usize,
+        writer: &mut ChunkWriter<'_, S>,
+        stats: &mut FrameStats,
+    ) -> Result<(), S::Error> {
+        let fb_w = self.width as usize;
+        let fb_h = self.height as usize;
+        let base8_addr = (fb_w * fb_h * 2) as u32;
+        let mut refined = 0usize;
+
+        for y in 0..fb_h {
+            if refined >= max_rows || self.base8_dirty_count == 0 {
+                break;
+            }
+            if !self.row_base8_dirty[y] {
+                continue;
+            }
+
+            let src_off = y.saturating_mul(stride_bytes);
+            let src_end = src_off + fb_w * 4;
+            if src_end > surface.len() {
+                break;
+            }
+            let src_bytes = &surface[src_off..src_end];
+            let scratch8 = &mut self.row_scratch8[..fb_w];
+            for (dst, px) in scratch8.iter_mut().zip(src_bytes.as_chunks::<4>().0) {
+                *dst = bgra_to_rgb323_low(px[0], px[1], px[2]);
+            }
+
+            let shadow_row = &mut self.shadow_fb8[y * fb_w..(y + 1) * fb_w];
+            let mut idx = 0usize;
+            while idx < fb_w {
+                while idx < fb_w && scratch8[idx] == shadow_row[idx] {
+                    idx += 1;
+                }
+                if idx >= fb_w {
+                    break;
+                }
+                let span_start = idx;
+                let mut last_diff = idx;
+                idx += 1;
+                let mut same_run = 0usize;
+                while idx < fb_w {
+                    if scratch8[idx] == shadow_row[idx] {
+                        same_run += 1;
+                        if same_run >= MIN_UNCHANGED_GAP {
+                            break;
+                        }
+                    } else {
+                        same_run = 0;
+                        last_diff = idx;
+                    }
+                    idx += 1;
+                }
+                let span_end = last_diff + 1;
+                shadow_row[span_start..span_end].copy_from_slice(&scratch8[span_start..span_end]);
+                let dev_addr = base8_addr + (y * fb_w + span_start) as u32;
+                writer.emit_span8(dev_addr, &scratch8[span_start..span_end], stats)?;
+            }
+
+            self.clear_row_base8_dirty(y);
+            refined += 1;
+        }
+        Ok(())
     }
 
     /// Restore up to `max_rows` degraded scanlines back to 100% bit-exact lossless RGB565.
@@ -577,7 +756,15 @@ impl FrameEncoder {
             if self.row_degraded[sy] {
                 self.mark_row_degraded(dy);
             }
+            if self.color_depth_24 {
+                self.shadow_fb8
+                    .copy_within(src_row_base..src_row_base + mw, dst_row_base);
+                if self.row_base8_dirty[sy] {
+                    self.mark_row_base8_dirty(dy);
+                }
+            }
 
+            let base8 = (w * h * 2) as u32;
             let mut remaining = mw;
             if reverse_x {
                 let mut offset = mw;
@@ -587,6 +774,14 @@ impl FrameEncoder {
                     let src_addr = ((src_row_base + offset) * 2) as u32;
                     let dst_addr = ((dst_row_base + offset) * 2) as u32;
                     writer.emit_copy16(dst_addr, src_addr, count, stats)?;
+                    if self.color_depth_24 {
+                        writer.emit_copy8(
+                            base8 + (dst_row_base + offset) as u32,
+                            base8 + (src_row_base + offset) as u32,
+                            count,
+                            stats,
+                        )?;
+                    }
                     remaining -= count;
                 }
             } else {
@@ -596,6 +791,14 @@ impl FrameEncoder {
                     let src_addr = ((src_row_base + offset) * 2) as u32;
                     let dst_addr = ((dst_row_base + offset) * 2) as u32;
                     writer.emit_copy16(dst_addr, src_addr, count, stats)?;
+                    if self.color_depth_24 {
+                        writer.emit_copy8(
+                            base8 + (dst_row_base + offset) as u32,
+                            base8 + (src_row_base + offset) as u32,
+                            count,
+                            stats,
+                        )?;
+                    }
                     offset += count;
                     remaining -= count;
                 }
@@ -677,8 +880,9 @@ impl FrameEncoder {
             if force {
                 shadow_row.copy_from_slice(scratch);
                 let dev_addr = ((y * fb_w + x0) * 2) as u32;
-                writer.emit_rlx16_span(dev_addr, scratch, stats)?;
+                writer.emit_span16(dev_addr, scratch, stats)?;
                 stats.pixels_changed += span_w as u64;
+                self.mark_row_base8_dirty(y);
                 continue;
             }
 
@@ -728,13 +932,16 @@ impl FrameEncoder {
 
                 shadow_row[span_start..span_end].copy_from_slice(&scratch[span_start..span_end]);
                 let dev_addr = ((y * fb_w + x0 + span_start) * 2) as u32;
-                writer.emit_rlx16_span(dev_addr, &scratch[span_start..span_end], stats)?;
+                writer.emit_span16(dev_addr, &scratch[span_start..span_end], stats)?;
                 stats.pixels_changed += (span_end - span_start) as u64;
                 row_modified = true;
             }
 
-            if row_modified && tier != QualityTier::Lossless {
-                self.mark_row_degraded(y);
+            if row_modified {
+                self.mark_row_base8_dirty(y);
+                if tier != QualityTier::Lossless {
+                    self.mark_row_degraded(y);
+                }
             }
         }
         Ok(())
@@ -746,14 +953,16 @@ struct ChunkWriter<'a, S: ChunkSink> {
     sink: &'a mut S,
     pos: usize,
     has_chunk: bool,
+    huffman_enabled: bool,
 }
 
 impl<'a, S: ChunkSink> ChunkWriter<'a, S> {
-    fn new(sink: &'a mut S) -> Self {
+    fn new(sink: &'a mut S, huffman_enabled: bool) -> Self {
         Self {
             sink,
             pos: 0,
             has_chunk: false,
+            huffman_enabled,
         }
     }
 
@@ -779,19 +988,29 @@ impl<'a, S: ChunkSink> ChunkWriter<'a, S> {
         Ok(())
     }
 
-    fn emit_copy16(
+    fn emit_raw_cmd(&mut self, bytes: &[u8], stats: &mut FrameStats) -> Result<(), S::Error> {
+        self.ensure_space(bytes.len() + 1, stats)?;
+        let buf = self.sink.acquire_chunk()?;
+        let p = self.pos;
+        buf[p..p + bytes.len()].copy_from_slice(bytes);
+        self.pos = p + bytes.len();
+        Ok(())
+    }
+
+    fn emit_copy_cmd(
         &mut self,
+        opcode: u8,
         dst_addr: u32,
         src_addr: u32,
         pixel_count: usize,
         stats: &mut FrameStats,
     ) -> Result<(), S::Error> {
         debug_assert!((1..=MAX_CMD_PIXELS).contains(&pixel_count));
-        self.ensure_space(COPY16_CMD_BYTES, stats)?;
+        self.ensure_space(COPY_CMD_BYTES, stats)?;
         let buf = self.sink.acquire_chunk()?;
         let p = self.pos;
         buf[p] = UDL_MSG_BULK;
-        buf[p + 1] = UDL_CMD_WRITECOPY16;
+        buf[p + 1] = opcode;
         buf[p + 2] = ((dst_addr >> 16) & 0xFF) as u8;
         buf[p + 3] = ((dst_addr >> 8) & 0xFF) as u8;
         buf[p + 4] = (dst_addr & 0xFF) as u8;
@@ -799,7 +1018,192 @@ impl<'a, S: ChunkSink> ChunkWriter<'a, S> {
         buf[p + 6] = ((src_addr >> 16) & 0xFF) as u8;
         buf[p + 7] = ((src_addr >> 8) & 0xFF) as u8;
         buf[p + 8] = (src_addr & 0xFF) as u8;
-        self.pos = p + COPY16_CMD_BYTES;
+        self.pos = p + COPY_CMD_BYTES;
+        Ok(())
+    }
+
+    fn emit_copy16(
+        &mut self,
+        dst_addr: u32,
+        src_addr: u32,
+        pixel_count: usize,
+        stats: &mut FrameStats,
+    ) -> Result<(), S::Error> {
+        self.emit_copy_cmd(UDL_CMD_WRITECOPY16, dst_addr, src_addr, pixel_count, stats)
+    }
+
+    fn emit_copy8(
+        &mut self,
+        dst_addr: u32,
+        src_addr: u32,
+        pixel_count: usize,
+        stats: &mut FrameStats,
+    ) -> Result<(), S::Error> {
+        self.emit_copy_cmd(UDL_CMD_WRITECOPY8, dst_addr, src_addr, pixel_count, stats)
+    }
+
+    /// Encode a single <= 256 px `WRITERLX16` (`0xAF 0x6B`) command into `out` and return its length.
+    #[inline]
+    fn build_rlx16_cmd(dev_addr: u32, pixels: &[u16], out: &mut [u8]) -> usize {
+        debug_assert!(!pixels.is_empty() && pixels.len() <= MAX_CMD_PIXELS);
+        out[0] = UDL_MSG_BULK;
+        out[1] = UDL_CMD_WRITERLX16;
+        out[2] = ((dev_addr >> 16) & 0xFF) as u8;
+        out[3] = ((dev_addr >> 8) & 0xFF) as u8;
+        out[4] = (dev_addr & 0xFF) as u8;
+        out[5] = (pixels.len() & 0xFF) as u8;
+        let mut raw_count_idx = 6usize;
+        let mut cmd = 7usize;
+        let mut cursor = 0usize;
+        let mut raw_start = 0usize;
+        let total = pixels.len();
+
+        while cursor < total {
+            let run_start = cursor;
+            let px = pixels[cursor];
+            let be = px.to_be_bytes();
+            out[cmd] = be[0];
+            out[cmd + 1] = be[1];
+            cmd += 2;
+            cursor += 1;
+
+            while cursor < total && pixels[cursor] == px {
+                cursor += 1;
+            }
+            let run_len = cursor - run_start;
+            if run_len > 1 {
+                let raw_count = (run_start - raw_start) + 1;
+                out[raw_count_idx] = (raw_count & 0xFF) as u8;
+                out[cmd] = ((run_len - 1) & 0xFF) as u8;
+                cmd += 1;
+                raw_start = cursor;
+                raw_count_idx = cmd;
+                cmd += 1;
+            }
+        }
+        if cursor > raw_start {
+            out[raw_count_idx] = ((cursor - raw_start) & 0xFF) as u8;
+        } else {
+            cmd -= 1;
+        }
+        cmd
+    }
+
+    /// Encode a single <= 256 px `WRITERLX8` (`0xAF 0x63`) command into `out` and return its length.
+    #[inline]
+    fn build_rlx8_cmd(dev_addr: u32, pixels: &[u8], out: &mut [u8]) -> usize {
+        debug_assert!(!pixels.is_empty() && pixels.len() <= MAX_CMD_PIXELS);
+        out[0] = UDL_MSG_BULK;
+        out[1] = UDL_CMD_WRITERLX8;
+        out[2] = ((dev_addr >> 16) & 0xFF) as u8;
+        out[3] = ((dev_addr >> 8) & 0xFF) as u8;
+        out[4] = (dev_addr & 0xFF) as u8;
+        out[5] = (pixels.len() & 0xFF) as u8;
+        let mut raw_count_idx = 6usize;
+        let mut cmd = 7usize;
+        let mut cursor = 0usize;
+        let mut raw_start = 0usize;
+        let total = pixels.len();
+
+        while cursor < total {
+            let run_start = cursor;
+            let px = pixels[cursor];
+            out[cmd] = px;
+            cmd += 1;
+            cursor += 1;
+
+            while cursor < total && pixels[cursor] == px {
+                cursor += 1;
+            }
+            let run_len = cursor - run_start;
+            if run_len > 1 {
+                let raw_count = (run_start - raw_start) + 1;
+                out[raw_count_idx] = (raw_count & 0xFF) as u8;
+                out[cmd] = ((run_len - 1) & 0xFF) as u8;
+                cmd += 1;
+                raw_start = cursor;
+                raw_count_idx = cmd;
+                cmd += 1;
+            }
+        }
+        if cursor > raw_start {
+            out[raw_count_idx] = ((cursor - raw_start) & 0xFF) as u8;
+        } else {
+            cmd -= 1;
+        }
+        cmd
+    }
+
+    /// Emit a 16-bit pixel span, automatically selecting the smaller of `WRITERLX16` (`0x6B`)
+    /// and hardware Huffman `WRITECOMP16` (`0x78`) per sub-chunk when Huffman is enabled.
+    fn emit_span16(
+        &mut self,
+        mut dev_addr: u32,
+        pixels: &[u16],
+        stats: &mut FrameStats,
+    ) -> Result<(), S::Error> {
+        if !self.huffman_enabled {
+            return self.emit_rlx16_span(dev_addr, pixels, stats);
+        }
+
+        let mut rlx_buf = [0u8; 640];
+        let mut comp_buf = [0u8; 640];
+        let mut cursor = 0usize;
+        let total = pixels.len();
+
+        while cursor < total {
+            let n = MAX_CMD_PIXELS.min(total - cursor);
+            let sub = &pixels[cursor..cursor + n];
+            let rlx_len = Self::build_rlx16_cmd(dev_addr, sub, &mut rlx_buf);
+
+            // Skip Huffman when RLE already achieved > ~8x compression (long flat runs > ~24 px).
+            if rlx_len > (n >> 2) + 16 {
+                let comp_len = encode_comp16_command(dev_addr, sub, &mut comp_buf);
+                // Only pick WRITECOMP16 when strictly smaller than RLX16 AND within 504 B (< 512 B USB packet).
+                if comp_len < rlx_len && comp_len <= 504 {
+                    self.emit_raw_cmd(&comp_buf[..comp_len], stats)?;
+                } else {
+                    self.emit_raw_cmd(&rlx_buf[..rlx_len], stats)?;
+                }
+            } else {
+                self.emit_raw_cmd(&rlx_buf[..rlx_len], stats)?;
+            }
+
+            dev_addr = dev_addr.wrapping_add((n * 2) as u32);
+            cursor += n;
+        }
+        Ok(())
+    }
+
+    /// Emit an 8-bit `base8` (`RGB323`) span using `WRITERLX8` (`0x63`) or `WRITECOMP8` (`0x70`).
+    fn emit_span8(
+        &mut self,
+        mut dev_addr: u32,
+        pixels: &[u8],
+        stats: &mut FrameStats,
+    ) -> Result<(), S::Error> {
+        let mut rlx_buf = [0u8; 384];
+        let mut comp_buf = [0u8; 384];
+        let mut cursor = 0usize;
+        let total = pixels.len();
+
+        while cursor < total {
+            let n = MAX_CMD_PIXELS.min(total - cursor);
+            let sub = &pixels[cursor..cursor + n];
+            let rlx_len = Self::build_rlx8_cmd(dev_addr, sub, &mut rlx_buf);
+            if self.huffman_enabled && rlx_len > (n / 2) + 12 {
+                let comp_len = encode_comp8_command(dev_addr, sub, &mut comp_buf);
+                if comp_len < rlx_len {
+                    self.emit_raw_cmd(&comp_buf[..comp_len], stats)?;
+                } else {
+                    self.emit_raw_cmd(&rlx_buf[..rlx_len], stats)?;
+                }
+            } else {
+                self.emit_raw_cmd(&rlx_buf[..rlx_len], stats)?;
+            }
+            dev_addr = dev_addr.wrapping_add(n as u32);
+            cursor += n;
+        }
         Ok(())
     }
 
@@ -893,19 +1297,43 @@ impl<'a, S: ChunkSink> ChunkWriter<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::regs::{UDL_CMD_WRITERAW16, UDL_CMD_WRITEREG};
+    use crate::huffman::{encode_load_huffman_table, HuffHardwareSim};
+    use crate::regs::{
+        UDL_CMD_FLUSH_PIPE, UDL_CMD_LOAD_DECOMP_TABLE, UDL_CMD_WRITECOMP16, UDL_CMD_WRITECOMP8,
+        UDL_CMD_WRITECOPY8, UDL_CMD_WRITERAW16, UDL_CMD_WRITEREG, UDL_CMD_WRITERL8,
+        UDL_CMD_WRITERLX8,
+    };
 
     struct Dl1x5HardwareSim {
         vram: Vec<u16>,
+        vram8: Vec<u8>,
+        base8_offset: usize,
         regs: [u8; 256],
+        huff: Option<HuffHardwareSim>,
     }
 
     impl Dl1x5HardwareSim {
         fn new(width: usize, height: usize) -> Self {
             Self {
                 vram: vec![0u16; width * height],
+                vram8: vec![0u8; width * height],
+                base8_offset: width * height * 2,
                 regs: [0u8; 256],
+                huff: None,
             }
+        }
+
+        fn reconstruct_rgb888(&self) -> Vec<(u8, u8, u8)> {
+            self.vram
+                .iter()
+                .zip(self.vram8.iter())
+                .map(|(&p16, &p8)| {
+                    let r = (((p16 >> 8) & 0xF8) as u8) | ((p8 >> 5) & 0x07);
+                    let g = (((p16 >> 3) & 0xFC) as u8) | ((p8 >> 3) & 0x03);
+                    let b = (((p16 << 3) & 0xF8) as u8) | (p8 & 0x07);
+                    (r, g, b)
+                })
+                .collect()
         }
 
         fn execute(&mut self, stream: &[u8]) {
@@ -922,6 +1350,15 @@ mod tests {
                 let cmd = stream[i];
                 i += 1;
                 match cmd {
+                    UDL_CMD_FLUSH_PIPE => {}
+                    UDL_CMD_LOAD_DECOMP_TABLE => {
+                        let count =
+                            u32::from_be_bytes([stream[i + 4], stream[i + 5], stream[i + 6], stream[i + 7]])
+                                as usize;
+                        let payload_len = 8 + count * 9;
+                        self.huff = Some(HuffHardwareSim::from_e0_payload(&stream[i..i + payload_len]));
+                        i += payload_len;
+                    }
                     UDL_CMD_WRITEREG => {
                         self.regs[stream[i] as usize] = stream[i + 1];
                         i += 2;
@@ -949,6 +1386,69 @@ mod tests {
                         i += 7;
                         let tmp = self.vram[src / 2..src / 2 + count].to_vec();
                         self.vram[dst / 2..dst / 2 + count].copy_from_slice(&tmp);
+                    }
+                    UDL_CMD_WRITECOPY8 => {
+                        let dst = ((stream[i] as usize) << 16)
+                            | ((stream[i + 1] as usize) << 8)
+                            | (stream[i + 2] as usize);
+                        let count = if stream[i + 3] == 0 { 256 } else { stream[i + 3] as usize };
+                        let src = ((stream[i + 4] as usize) << 16)
+                            | ((stream[i + 5] as usize) << 8)
+                            | (stream[i + 6] as usize);
+                        i += 7;
+                        let s = src - self.base8_offset;
+                        let d = dst - self.base8_offset;
+                        let tmp = self.vram8[s..s + count].to_vec();
+                        self.vram8[d..d + count].copy_from_slice(&tmp);
+                    }
+                    UDL_CMD_WRITERL8 => {
+                        let addr = ((stream[i] as usize) << 16)
+                            | ((stream[i + 1] as usize) << 8)
+                            | (stream[i + 2] as usize);
+                        let total = if stream[i + 3] == 0 { 256 } else { stream[i + 3] as usize };
+                        i += 4;
+                        let mut out_idx = addr - self.base8_offset;
+                        let mut written = 0usize;
+                        while written < total {
+                            let run = if stream[i] == 0 { 256 } else { stream[i] as usize };
+                            let val = stream[i + 1];
+                            i += 2;
+                            for _ in 0..run {
+                                self.vram8[out_idx] = val;
+                                out_idx += 1;
+                                written += 1;
+                            }
+                        }
+                    }
+                    UDL_CMD_WRITERLX8 => {
+                        let addr = ((stream[i] as usize) << 16)
+                            | ((stream[i + 1] as usize) << 8)
+                            | (stream[i + 2] as usize);
+                        let total = if stream[i + 3] == 0 { 256 } else { stream[i + 3] as usize };
+                        i += 4;
+                        let mut out_idx = addr - self.base8_offset;
+                        let mut written = 0usize;
+                        while written < total {
+                            let raw_cnt = if stream[i] == 0 { 256 } else { stream[i] as usize };
+                            i += 1;
+                            let mut last_px = 0u8;
+                            for _ in 0..raw_cnt {
+                                last_px = stream[i];
+                                i += 1;
+                                self.vram8[out_idx] = last_px;
+                                out_idx += 1;
+                                written += 1;
+                            }
+                            if written < total {
+                                let rep_cnt = if stream[i] == 0 { 256 } else { stream[i] as usize };
+                                i += 1;
+                                for _ in 0..rep_cnt {
+                                    self.vram8[out_idx] = last_px;
+                                    out_idx += 1;
+                                    written += 1;
+                                }
+                            }
+                        }
                     }
                     UDL_CMD_WRITERLX16 => {
                         let addr = ((stream[i] as usize) << 16)
@@ -979,6 +1479,30 @@ mod tests {
                                 }
                             }
                         }
+                    }
+                    UDL_CMD_WRITECOMP16 => {
+                        let addr = ((stream[i] as usize) << 16)
+                            | ((stream[i + 1] as usize) << 8)
+                            | (stream[i + 2] as usize);
+                        let total = if stream[i + 3] == 0 { 256 } else { stream[i + 3] as usize };
+                        i += 4;
+                        let huff = self.huff.as_ref().expect("Huffman table must be loaded first");
+                        let (decoded, consumed) = huff.decode_comp16(&stream[i..], total);
+                        let base = addr / 2;
+                        self.vram[base..base + total].copy_from_slice(&decoded);
+                        i += consumed;
+                    }
+                    UDL_CMD_WRITECOMP8 => {
+                        let addr = ((stream[i] as usize) << 16)
+                            | ((stream[i + 1] as usize) << 8)
+                            | (stream[i + 2] as usize);
+                        let total = if stream[i + 3] == 0 { 256 } else { stream[i + 3] as usize };
+                        i += 4;
+                        let huff = self.huff.as_ref().expect("Huffman table must be loaded first");
+                        let (decoded, consumed) = huff.decode_comp8(&stream[i..], total);
+                        let base = addr - self.base8_offset;
+                        self.vram8[base..base + total].copy_from_slice(&decoded);
+                        i += consumed;
                     }
                     other => panic!("Unexpected opcode {other:#04X}"),
                 }
@@ -1167,5 +1691,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn huffman_and_24bit_static_refinement_roundtrip_bit_exact_rgb888() {
+        let (w, h) = (320usize, 120usize);
+        let mut surface = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let off = (y * w + x) * 4;
+                // Smooth 24-bit color gradient with fine 1-step LSB variation
+                let r = ((x * 255) / w) as u8;
+                let g = ((y * 255) / h) as u8;
+                let b = (((x + y * 2) * 255) / (w + h * 2)) as u8;
+                surface[off] = b;
+                surface[off + 1] = g;
+                surface[off + 2] = r;
+                surface[off + 3] = 255;
+            }
+        }
+
+        // Measure RLX16-only size vs Hardware Huffman size on the exact same gradient!
+        let mut enc_rlx = FrameEncoder::new(w as u32, h as u32);
+        let mut sink_rlx = VecChunkSink::new(8192);
+        let stats_rlx = enc_rlx.encode_frame_bgra(&surface, w * 4, &[], &[], &mut sink_rlx).unwrap();
+
+        let mut enc = FrameEncoder::new(w as u32, h as u32);
+        enc.set_huffman_enabled(true);
+        enc.set_color_depth_24(true);
+
+        let mut sim = Dl1x5HardwareSim::new(w, h);
+        let mut init_cmd = Vec::new();
+        encode_load_huffman_table(&mut init_cmd);
+        sim.execute(&init_cmd);
+
+        let mut sink = VecChunkSink::new(8192);
+        let stats_huff = enc.encode_frame_bgra(&surface, w * 4, &[], &[], &mut sink).unwrap();
+        for c in &sink.submitted {
+            sim.execute(c);
+        }
+        // Huffman must be strictly lossless on RGB565 AND significantly smaller than RLX16 on smooth gradients!
+        assert_eq!(sim.vram, expected_rgb565(&surface, w, h));
+        assert!(
+            stats_huff.bytes_emitted < stats_rlx.bytes_emitted * 65 / 100,
+            "expected Huffman ({} B) < 65% of RLX16 ({} B)",
+            stats_huff.bytes_emitted,
+            stats_rlx.bytes_emitted
+        );
+
+        // Static refinement pass upgrades base8 to 100% bit-exact 24-bit RGB888!
+        assert!(enc.needs_refinement());
+        let mut sink_ref = VecChunkSink::new(8192);
+        enc.encode_frame_bgra_adaptive(&surface, w * 4, &[], &[], QualityTier::Lossless, &mut sink_ref)
+            .unwrap();
+        for c in &sink_ref.submitted {
+            sim.execute(c);
+        }
+        assert!(!enc.needs_refinement());
+
+        let expected24: Vec<(u8, u8, u8)> = surface
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| (px[2], px[1], px[0]))
+            .collect();
+        assert_eq!(sim.reconstruct_rgb888(), expected24);
     }
 }

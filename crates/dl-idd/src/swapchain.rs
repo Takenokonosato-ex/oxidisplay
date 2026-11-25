@@ -191,10 +191,15 @@ fn run_frame_loop(
     let mut pending_slot: Option<usize> = None;
     let mut next_write_slot: usize = 0;
 
-    // Ensure hardware display controller is configured to the active mode.
+    // Ensure hardware display controller is configured to the active mode,
+    // and activate hardware Huffman (`0xAF 0x78`) + static 24-bit `base8` refinement when ready.
     if let Ok(mut guard) = usb_lock.lock() {
         if let Some(ref mut usb) = *guard {
             let st = usb.set_video_mode(&mode);
+            if let Ok((huff_ok, depth24_ok)) = st {
+                encoder.set_huffman_enabled(huff_ok);
+                encoder.set_color_depth_24(depth24_ok);
+            }
             crate::trace_log(&format!("SwapChain: set_video_mode={:?}", st));
         }
     }

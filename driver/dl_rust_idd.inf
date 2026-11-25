@@ -10,7 +10,7 @@ ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
 ClassVer    = 2.0
 Provider    = %ManufacturerName%
 CatalogFile = dl_rust_idd.cat
-DriverVer   = 11/26/2026,1.0.0.0
+DriverVer   = 11/26/2026,1.1.0.0
 PnpLockdown = 1
 
 [Manufacturer]

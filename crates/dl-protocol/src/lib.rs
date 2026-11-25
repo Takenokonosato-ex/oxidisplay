@@ -2,18 +2,26 @@
 
 pub mod edid;
 pub mod encoder;
+pub mod huffman;
 pub mod regs;
 
 pub use edid::{is_valid_edid, parse_edid, ParsedEdid, DTU_1031_FALLBACK_EDID, EDID_BLOCK_SIZE};
 pub use encoder::{
-    bgra_to_rgb565, bgra_to_rgb565_dither, ChunkSink, DirtyRect, FrameEncoder, FrameStats,
-    MoveRegion, QualityTier, VecChunkSink, DEFAULT_USB_CHUNK_SIZE,
+    bgra_to_rgb323_low, bgra_to_rgb565, bgra_to_rgb565_dither, ChunkSink, DirtyRect, FrameEncoder,
+    FrameStats, MoveRegion, QualityTier, VecChunkSink, DEFAULT_USB_CHUNK_SIZE,
+};
+pub use huffman::{
+    build_hardware_table, encode_comp16_command, encode_comp8_command, encode_load_huffman_table,
+    encode_rgb565_delta_code, HUFF_TABLE_BYTES, HUFF_TABLE_ENTRIES, HUFF_TABLE_MAGIC,
 };
 pub use regs::{
-    encode_blank_mode, encode_mode_set, lfsr16, parse_vendor_descriptor, BlankMode,
-    VendorDescriptor, VideoMode, DEFAULT_SKU_PIXEL_LIMIT, STD_CHANNEL_PAYLOAD, UDL_CMD_WRITECOPY16,
-    UDL_CMD_WRITERAW16, UDL_CMD_WRITEREG, UDL_CMD_WRITERL16, UDL_CMD_WRITERLX16, UDL_MSG_BULK,
-    USB_DESC_TYPE_VENDOR_DL, USB_REQ_I2C_READ, USB_REQ_SET_CHANNEL,
+    encode_blank_mode, encode_clear_base8, encode_mode_set, encode_mode_set_with_depth, lfsr16,
+    parse_vendor_descriptor, BlankMode, ColorDepth, VendorDescriptor, VideoMode,
+    DEFAULT_SKU_PIXEL_LIMIT, STD_CHANNEL_PAYLOAD, UDL_CMD_FLUSH_PIPE, UDL_CMD_LOAD_DECOMP_TABLE,
+    UDL_CMD_WRITECOMP16, UDL_CMD_WRITECOMP8, UDL_CMD_WRITECOPY16, UDL_CMD_WRITECOPY8,
+    UDL_CMD_WRITERAW16, UDL_CMD_WRITERAW8, UDL_CMD_WRITEREG, UDL_CMD_WRITERL16, UDL_CMD_WRITERL8,
+    UDL_CMD_WRITERLX16, UDL_CMD_WRITERLX8, UDL_MSG_BULK, USB_DESC_TYPE_VENDOR_DL,
+    USB_REQ_GET_STATUS, USB_REQ_I2C_READ, USB_REQ_SET_CHANNEL,
 };
 
 #[cfg(test)]

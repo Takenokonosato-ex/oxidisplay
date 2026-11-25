@@ -13,8 +13,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use dl_protocol::{
-    encode_blank_mode, encode_mode_set, is_valid_edid, BlankMode, ChunkSink, VideoMode,
-    DEFAULT_USB_CHUNK_SIZE, DTU_1031_FALLBACK_EDID, EDID_BLOCK_SIZE, STD_CHANNEL_PAYLOAD,
+    encode_blank_mode, encode_clear_base8, encode_load_huffman_table, encode_mode_set_with_depth,
+    is_valid_edid, BlankMode, ChunkSink, ColorDepth, VideoMode, DEFAULT_USB_CHUNK_SIZE,
+    DTU_1031_FALLBACK_EDID, EDID_BLOCK_SIZE, STD_CHANNEL_PAYLOAD, USB_REQ_GET_STATUS,
     USB_REQ_I2C_READ, USB_REQ_SET_CHANNEL,
 };
 
@@ -65,6 +66,10 @@ pub struct UsbTransport {
     #[allow(clippy::vec_box)]
     ctxs: Vec<Box<CompletionCtx>>,
     pool: Arc<UrbPoolInner>,
+    /// True if device status bit 24 selects alternate color-depth register values (0x08 / 0x09).
+    alt_depth_reg: bool,
+    /// True once the 512-entry hardware Huffman table (`0xAF 0xE0`) has been uploaded cleanly.
+    huffman_loaded: bool,
 }
 
 unsafe impl Send for UsbTransport {}
@@ -185,16 +190,33 @@ impl UsbTransport {
             }
             pool.state.lock().unwrap().free_slots = free_slots;
 
-            let transport = Self {
+            let mut transport = Self {
                 usb_device,
                 bulk_out_pipe,
                 slots,
                 ctxs,
                 pool,
+                alt_depth_reg: false,
+                huffman_loaded: false,
             };
 
             // Initialize DisplayLink standard channel (control OUT 0x12).
             let _ = transport.select_std_channel();
+
+            // Query device capabilities/status (control IN 0x06) for color-depth register encoding.
+            if let Some(status) = transport.read_device_status() {
+                transport.alt_depth_reg = ((status >> 24) & 1) != 0;
+                crate::trace_log(&format!(
+                    "USB: device status=0x{:08X} alt_depth_reg={}",
+                    status, transport.alt_depth_reg
+                ));
+            }
+
+            // Upload clean-room 512-entry hardware Huffman table (`0xAF 0xE0`).
+            if transport.upload_huffman_table().is_ok() {
+                transport.huffman_loaded = true;
+                crate::trace_log("USB: hardware Huffman table (0xAF 0xE0) loaded");
+            }
 
             Ok(transport)
         }
@@ -298,12 +320,76 @@ impl UsbTransport {
         }
     }
 
-    /// Program the DL-1x5 display controller with `mode` (synchronous after draining in-flight URBs).
-    pub fn set_video_mode(&mut self, mode: &VideoMode) -> Result<(), NTSTATUS> {
-        self.wait_all_in_flight(Duration::from_secs(2));
-        let mut cmd = Vec::with_capacity(256);
-        encode_mode_set(mode, &mut cmd);
+    /// Query DL-1x5 device status / capabilities via vendor control IN (`0xC0 0x06`).
+    pub fn read_device_status(&self) -> Option<u32> {
+        let mut rbuf = [0u8; 4];
+        let mut setup = WDF_USB_CONTROL_SETUP_PACKET {
+            bm_request_type: 0xC0,
+            b_request: USB_REQ_GET_STATUS,
+            w_value: 0,
+            w_index: 0,
+            w_length: 4,
+        };
+        let mut mem = WDF_MEMORY_DESCRIPTOR {
+            desc_type: WDF_MEMORY_DESCRIPTOR_TYPE_BUFFER,
+            _pad0: 0,
+            buffer: rbuf.as_mut_ptr() as *mut c_void,
+            length: 4,
+            _pad1: 0,
+        };
+        let mut opts = WDF_REQUEST_SEND_OPTIONS {
+            size: size_of::<WDF_REQUEST_SEND_OPTIONS>() as u32,
+            flags: WDF_REQUEST_SEND_OPTION_TIMEOUT,
+            timeout: USB_TIMEOUT_2S,
+        };
+        let mut transferred = 0u32;
+        let st = unsafe {
+            wdf_usb_target_device_send_control_sync(
+                self.usb_device,
+                core::ptr::null_mut(),
+                &mut opts,
+                &mut setup,
+                &mut mem,
+                &mut transferred,
+            )
+        };
+        if nt_success(st) && transferred >= 4 {
+            Some(u32::from_le_bytes(rbuf))
+        } else {
+            None
+        }
+    }
+
+    /// Upload the clean-room 512-entry hardware decompression table (`0xAF 0xE0`).
+    pub fn upload_huffman_table(&self) -> Result<(), NTSTATUS> {
+        let mut cmd = Vec::with_capacity(4700);
+        encode_load_huffman_table(&mut cmd);
         self.write_sync(&cmd)
+    }
+
+    /// Program the DL-1x5 display controller with `mode` (synchronous after draining in-flight URBs).
+    /// Enables 24-bit dual-plane mode (`base16` + `base8`) when the mode fits comfortably in VRAM.
+    /// Returns `Ok((huffman_ready, color_depth_24))`.
+    pub fn set_video_mode(&mut self, mode: &VideoMode) -> Result<(bool, bool), NTSTATUS> {
+        self.wait_all_in_flight(Duration::from_secs(2));
+        if self.upload_huffman_table().is_ok() {
+            self.huffman_loaded = true;
+        }
+        let use_24bpp = (mode.pixel_count() as u64).saturating_mul(3) <= 8 * 1024 * 1024;
+        let depth = if use_24bpp {
+            ColorDepth::Bpp24
+        } else {
+            ColorDepth::Bpp16
+        };
+        let mut cmd = Vec::with_capacity(512);
+        encode_mode_set_with_depth(mode, depth, self.alt_depth_reg, &mut cmd);
+        self.write_sync(&cmd)?;
+        if use_24bpp {
+            let mut clear_cmd = Vec::with_capacity(36 * 1024);
+            encode_clear_base8(mode, &mut clear_cmd);
+            self.write_sync(&clear_cmd)?;
+        }
+        Ok((self.huffman_loaded, use_24bpp))
     }
 
     /// Set blank / DPMS power state on the DL-1x5 hardware.

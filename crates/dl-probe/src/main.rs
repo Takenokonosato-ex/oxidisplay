@@ -213,7 +213,46 @@ fn main() {
     let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
     report("5. 640x360 Video Window Update", dt_ms, stats.bytes_emitted, raw_rgb565_bytes, USB2_MBPS);
 
-    // Scenario F: Full-screen 1280x800 high-entropy frame (worst case)
+    // Scenario F: Full-screen 1280x800 smooth video / gradient frame (Lossless RLX16 vs Hardware Huffman!)
+    let mut smooth_vid = vec![0u8; stride * h];
+    for y in 0..h {
+        for x in 0..w {
+            let off = y * stride + x * 4;
+            smooth_vid[off] = ((x * 255) / w) as u8;
+            smooth_vid[off + 1] = ((y * 255) / h) as u8;
+            smooth_vid[off + 2] = (((x + y) * 255) / (w + h)) as u8;
+            smooth_vid[off + 3] = 255;
+        }
+    }
+    sink.reset();
+    let t0 = Instant::now();
+    let stats = encoder
+        .encode_frame_bgra(&smooth_vid, stride, &[], &full, &mut sink)
+        .unwrap();
+    let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    report("6a. Full-Screen Smooth Video (RLX16 only)", dt_ms, stats.bytes_emitted, raw_rgb565_bytes, USB2_MBPS);
+
+    let mut huff_encoder = FrameEncoder::new(w as u32, h as u32);
+    huff_encoder.set_huffman_enabled(true);
+    sink.reset();
+    let t0 = Instant::now();
+    let stats_h = huff_encoder
+        .encode_frame_bgra(&smooth_vid, stride, &[], &full, &mut sink)
+        .unwrap();
+    let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    report("6b. Full-Screen Smooth Video (HW Huffman)", dt_ms, stats_h.bytes_emitted, raw_rgb565_bytes, USB2_MBPS);
+
+    // Scenario G: 640x360 Video Window with Hardware Huffman
+    huff_encoder.encode_frame_bgra(&scrolled, stride, &[], &full, &mut sink).unwrap();
+    sink.reset();
+    let t0 = Instant::now();
+    let stats_vh = huff_encoder
+        .encode_frame_bgra(&vid, stride, &[], &vid_rect, &mut sink)
+        .unwrap();
+    let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    report("7. 640x360 Video Window (HW Huffman)", dt_ms, stats_vh.bytes_emitted, raw_rgb565_bytes, USB2_MBPS);
+
+    // Scenario H: Full-screen 1280x800 high-entropy frame (worst case)
     let mut noise = vec![0u8; stride * h];
     let mut seed = 0x1234_5678u32;
     for chunk in noise.as_chunks_mut::<4>().0 {
@@ -225,11 +264,11 @@ fn main() {
     }
     sink.reset();
     let t0 = Instant::now();
-    let stats = encoder
+    let stats = huff_encoder
         .encode_frame_bgra(&noise, stride, &[], &full, &mut sink)
         .unwrap();
     let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    report("6. Full-Screen 100% Random Noise (Worst Case)", dt_ms, stats.bytes_emitted, raw_rgb565_bytes, USB2_MBPS);
+    report("8. Full-Screen Random Noise (HW Huffman+RLX)", dt_ms, stats.bytes_emitted, raw_rgb565_bytes, USB2_MBPS);
 
     let _ = VideoMode::DTU_1031_1280X800_60;
 }

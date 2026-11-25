@@ -10,40 +10,42 @@ Tested on **Wacom DTU-1031** (`USB\VID_17E9&PID_04A3`, 1280×800 @ 60 Hz) on Win
 
 ## Highlights / 主な特徴
 
-- **Up to ~60 Hz Frame Pacing on USB 2.0**: Achieves **`p50 = 16.7–16.8 ms`** (`47.9–56.7 FPS` sustained on full-screen 1280×800 workloads) — **+49% to +76% higher frame rate** than the official DisplayLink driver (`32.1–32.3 FPS`, `p50 = 31.1–31.3 ms`) while using **50% less CPU** and **21% less USB traffic** on the same hardware.
-- **Zero Per-Frame Allocations & Leak-Free**: Pre-allocated shadow framebuffer, pre-allocated 12 × 128 KiB asynchronous USB Bulk OUT URB ring (`WdfRequestReuse`), and fixed command scratch buffer eliminate runtime heap churn and memory leaks.
+- **Locked 60 FPS Full-Screen on USB 2.0**: Achieves **59.6–60.0 FPS** (`p50 = 16.6 ms`, `p95 = 18.6–20.2 ms`) across idle, UI scroll, video, and full-screen 1280×800 motion workloads — **+85% to +89% higher frame rate** than the official DisplayLink driver (`31.7–32.3 FPS`, `p50 = 30.9–31.1 ms`) while using **27% less USB traffic** and **60% fewer IOCTLs**.
+- **Clean-Room Programmable Hardware Huffman (`0xAF 0xE0` + `0x78`/`0x70`)**: Generates and uploads its own 512-entry additive delta prefix tree to the DL-1x5 hardware decompression engine (zero proprietary blobs), adaptively choosing the smaller of Hardware Huffman vs. `WRITERLX16` per span (~45% smaller lossless video frames).
+- **Static 24-bit Color Refinement (`base16` + `base8` `RGB323`)**: Streams 16-bit `RGB565` during motion for zero FPS penalty, then automatically upgrades static frames to full **24-bit RGB888** (`base8` lower 3-2-3 bits) once motion settles.
+- **Zero Per-Frame Allocations & Leak-Free**: Pre-allocated shadow framebuffers (`base16` + `base8`), pre-allocated 12 × 128 KiB asynchronous USB Bulk OUT URB ring (`WdfRequestReuse`), and fixed scratch buffers eliminate runtime heap churn and memory leaks (`+0.0 MB` / `0` handle delta).
 - **Zero External Crate Dependencies**: Links directly against Windows WDK (`WdfDriverStubUm.lib`, `iddcxstub.lib`), `d3d11.lib`, `dxgi.lib`, `avrt.lib`, and `ntdll.lib` with compile-time ABI `size_of` assertions.
-- **Tiny Footprint**: `dl_rust_idd.dll` is **~241 KB** (vs. **10.6 MB** for official `dlidusb4.dll`), using **30% less Working Set** and **31% fewer kernel handles**.
+- **Tiny Footprint**: `dl_rust_idd.dll` is **~257 KB** (vs. **10.6 MB** for official `dlidusb4.dll`), using **29% less Working Set** and **31% fewer kernel handles**.
 - **Low-Latency Pipeline**:
   - **Double-buffered ping-pong D3D11 staging textures** (non-blocking `CopyResource` overlapped with CPU encode of the previous frame) + early `IddCxSwapChainFinishedProcessingFrame`.
   - **Runtime-dispatched AVX2 / SSE2 SIMD** BGRA→RGB565 conversion and shadow-buffer diff scanning.
-  - **Hardware `WRITECOPY16` (`0xAF 0x6A`)** VRAM blit acceleration for IddCx move regions (scrolling/window drag).
-  - **3-tier adaptive quantization** (`Lossless` → `MotionFast` RGB454 + temporal deadzone → `MotionUltra` RGB444 + 2 px RLE smoothing + alternating scanlines) with **automatic lossless static refinement** once motion settles.
+  - **Hardware `WRITECOPY16` / `WRITECOPY8` (`0xAF 0x6A` / `0x62`)** VRAM blit acceleration for IddCx move regions (scrolling/window drag).
+  - **3-tier adaptive quantization** (`Lossless` → `MotionFast` RGB454 + temporal deadzone → `MotionUltra` RGB444 + 2 px RLE smoothing + alternating scanlines) with **automatic lossless + 24-bit static refinement**.
   - **MMCSS (`DisplayPostProcessing`)** + `IddCxSetRealtimeGPUPriority`.
 
 ---
 
-## Benchmark: Official Driver vs. `oxidisplay` `v1.0.0.0`
+## Benchmark: Official Driver vs. `oxidisplay` `v1.1.0.0`
 
 Measured head-to-head on **Wacom DTU-1031 (full-screen 1280×800 @ 60 Hz, Per-Monitor-V2 DPI-aware)** using [`dl-bench`](crates/dl-probe/src/bin/dl-bench.rs) (18-second standardized 60 Hz D3D11 Flip-Model workload across 4 phases) and Windows kernel ETW (`Microsoft-Windows-IndirectDisplays-ClassExtension-Events`, Event ID 25):
 
-| Metric | Official DisplayLink (`11.2.3146.0`) | **`oxidisplay` `v1.0.0.0` (AVX2 + Ping-Pong)** | vs. Official |
-| --- | ---: | ---: | ---: |
-| **Total IddCx Frames (18s)** | 603 | **957** | **+58.7%** |
-| **Phase 1: Idle (0–3s)** | 32.2 FPS (`p50 31.2 ms`) | **56.7 FPS (`p50 16.7 ms`)** | **+76%** |
-| **Phase 2: UI Scroll (3–8s)** | 32.1 FPS (`p50 31.3 ms`) | **51.1 FPS (`p50 16.8 ms`)** | **+59%** |
-| **Phase 3: Video Box (8–13s)** | 32.3 FPS (`p50 31.2 ms`) | **51.3 FPS (`p50 16.8 ms`)** | **+59%** |
-| **Phase 4: Full Motion (13–18s)** | 32.1 FPS (`p50 31.1 ms`) | **47.9 FPS (`p50 16.8 ms`)** | **+49%** |
-| **Driver Host CPU (12 logical CPUs)** | Avg 1.35% (1-core: 16.2%) | **Avg 0.67% (1-core: 8.0%)** | **-50% CPU** |
-| **USB Bulk Traffic (`IO Other`)** | 407.3 MB (`26.16 MB/s`) | **323.0 MB (`20.73 MB/s`)** | **-21% bytes** |
-| **USB IOCTL Rate** | 477 IOCTLs/s | **196 IOCTLs/s** | **-59% IOCTLs** |
-| **Driver Binary Size** | 10,820 KB | **241 KB** | **-97.8%** |
-| **Host Working Set (Delta)** | 71.6 MB (`0.0 MB`) | **50.4 MB (`0.0 MB`)** | **-30%** |
-| **Host Private Memory (Delta)** | 85.3 MB (`0.0 MB`) | **67.1 MB (`0.0 MB`)** | **-21%** |
-| **Host Kernel Handles (Delta)** | 728 (`0`) | **503 (`0`)** | **-31%** |
+| Metric | Official DisplayLink (`11.2.3146.0`) | `oxidisplay` `v1.0.0.0` (RLX16) | **`oxidisplay` `v1.1.0.0` (HW Huffman + 24-bit)** | vs. Official |
+| --- | ---: | ---: | ---: | ---: |
+| **Total IddCx Frames (18s)** | 601 | 957 | **1,127** | **+87.5%** |
+| **Phase 1: Idle (0–3s)** | 31.9 FPS (`p50 30.9 ms`) | 56.7 FPS (`p50 16.7 ms`) | **59.6 FPS (`p50 16.6 ms`)** | **+87%** |
+| **Phase 2: UI Scroll (3–8s)** | 31.7 FPS (`p50 31.1 ms`) | 51.1 FPS (`p50 16.8 ms`) | **60.0 FPS (`p50 16.6 ms, max 21.2 ms`)** | **+89%** |
+| **Phase 3: Video Box (8–13s)** | 32.1 FPS (`p50 31.0 ms`) | 51.3 FPS (`p50 16.8 ms`) | **60.0 FPS (`p50 16.6 ms, max 21.7 ms`)** | **+87%** |
+| **Phase 4: Full Motion (13–18s)** | 32.3 FPS (`p50 31.1 ms`) | 47.9 FPS (`p50 16.8 ms`) | **59.8 FPS (`p50 16.6 ms`)** | **+85%** |
+| **USB Bulk Traffic (`IO Other`)** | 405.0 MB (`26.04 MB/s`) | 323.0 MB (`20.73 MB/s`) | **297.1 MB (`19.05 MB/s`)** | **-27% bytes** |
+| **USB IOCTL Rate** | 475 IOCTLs/s | 196 IOCTLs/s | **191 IOCTLs/s** | **-60% IOCTLs** |
+| **Driver Binary Size** | 10,820 KB | 241 KB | **257 KB** | **-97.6%** |
+| **Host Working Set (Delta)** | 71.1 MB (`0.0 MB`) | 50.4 MB (`0.0 MB`) | **50.8 MB (`0.0 MB`)** | **-29%** |
+| **Host Private Memory (Delta)** | 84.8 MB (`0.0 MB`) | 67.1 MB (`0.0 MB`) | **67.0 MB (`0.0 MB`)** | **-21%** |
+| **Host Kernel Handles (Delta)** | 724 (`0`) | 503 (`0`) | **503 (`0`)** | **-31%** |
+| **Driver Host CPU (12 logical CPUs)** | Avg 1.37% (1-core: 16.4%) | Avg 0.67% (1-core: 8.0%) | **Avg 3.09% (1-core: 37.1%)** | +1.72% total |
 
-> **Why is CPU usage only ~0.67%?**  
-> On Windows, **DWM and applications still render on your GPU** (Direct3D / DXGI). The DisplayLink driver only reads back dirty regions, converts BGRA→RGB565/RLE using AVX2 SIMD (taking `0.07–0.93 ms` per frame for typical desktop/video frames), and streams Bulk URBs over USB.
+> **Why is CPU usage only ~3.1% even at full-screen 60 FPS with Hardware Huffman?**  
+> On Windows, **DWM and applications still render on your GPU** (Direct3D / DXGI). `oxidisplay` only reads back dirty regions via ping-pong staging textures, converts BGRA→RGB565 using AVX2 SIMD, encodes smooth/video spans into the DL-1x5 hardware Huffman bitstream (`0xAF 0x78`), and streams async Bulk URBs over USB.
 
 ---
 
@@ -61,7 +63,7 @@ flowchart LR
 
 | Path | Description |
 | --- | --- |
-| [`crates/dl-protocol`](crates/dl-protocol) | Clean-room DL-1x5 protocol library: `0xAF` register/mode-set/blank commands, LFSR16 timing encoder, EDID 1.3 parser, AVX2/SSE2 RGB565 & diff encoder, `WRITECOPY16` move-region blitter, adaptive RLE encoder, and unit tests with a software VRAM decoder simulator. |
+| [`crates/dl-protocol`](crates/dl-protocol) | Clean-room DL-1x5 protocol library: `0xAF` register/mode-set/blank commands, LFSR16 timing encoder, EDID 1.3 parser, AVX2/SSE2 RGB565 & diff encoder, clean-room programmable hardware Huffman (`0xAF 0xE0` + `0x78`/`0x70`), 24-bit `base8` (`RGB323`) refinement, `WRITECOPY16`/`WRITECOPY8` blitter, and unit tests with a full hardware VRAM + Huffman simulator. |
 | [`crates/dl-idd`](crates/dl-idd) | Native Windows UMDF 2.33 + IddCx 1.10 driver (`dl_rust_idd.dll`). Handles WDF PnP/Power, WinUSB Bulk OUT async ring, D3D11 ping-pong readback, MMCSS realtime thread pump, and WDK ABI validation. |
 | [`crates/dl-probe`](crates/dl-probe) | Developer utilities: `dl-probe` (offline AVX2 compression & EDID/LFSR16 benchmark) and `dl-bench` (60 Hz 4-phase D3D11 workload generator for ETW A/B benchmarking). |
 | [`driver/dl_rust_idd.inf`](driver/dl_rust_idd.inf) | Windows driver INF (`UmdfLibraryVersion = 2.33.0`, `UmdfExtensions = IddCx0102`, `UpperFilters = IndirectKmd`, `UmdfDispatcher = NativeUSB`). |
@@ -89,7 +91,7 @@ flowchart LR
 
 ```powershell
 cargo test --workspace
-cargo run --release -p dl-probe
+cargo run --release -p dl-probe --bin dl-probe
 ```
 
 ### 2. Build & Test-Sign Driver Package
