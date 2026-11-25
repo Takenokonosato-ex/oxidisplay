@@ -10,7 +10,7 @@ Tested on **Wacom DTU-1031** (`USB\VID_17E9&PID_04A3`, 1280×800 @ 60 Hz) on Win
 
 ## Highlights / 主な特徴
 
-- **Locked 60 FPS on USB 2.0**: Achieves **59.6–60.2 FPS** (`p50 = 16.6 ms`) across idle, UI scroll, video, and full-screen motion workloads — **+73% to +85% higher frame rate** than the official DisplayLink driver (`~32–35 FPS`, `p50 = 30.7–31.3 ms`) on the same hardware.
+- **Up to ~60 Hz Frame Pacing on USB 2.0**: Achieves **`p50 = 16.7–16.8 ms`** (`47.9–56.7 FPS` sustained on full-screen 1280×800 workloads) — **+49% to +76% higher frame rate** than the official DisplayLink driver (`32.1–32.3 FPS`, `p50 = 31.1–31.3 ms`) while using **50% less CPU** and **21% less USB traffic** on the same hardware.
 - **Zero Per-Frame Allocations & Leak-Free**: Pre-allocated shadow framebuffer, pre-allocated 12 × 128 KiB asynchronous USB Bulk OUT URB ring (`WdfRequestReuse`), and fixed command scratch buffer eliminate runtime heap churn and memory leaks.
 - **Zero External Crate Dependencies**: Links directly against Windows WDK (`WdfDriverStubUm.lib`, `iddcxstub.lib`), `d3d11.lib`, `dxgi.lib`, `avrt.lib`, and `ntdll.lib` with compile-time ABI `size_of` assertions.
 - **Tiny Footprint**: `dl_rust_idd.dll` is **~241 KB** (vs. **10.6 MB** for official `dlidusb4.dll`), using **30% less Working Set** and **31% fewer kernel handles**.
@@ -23,26 +23,26 @@ Tested on **Wacom DTU-1031** (`USB\VID_17E9&PID_04A3`, 1280×800 @ 60 Hz) on Win
 
 ---
 
-## Benchmark: Official Driver vs. Rust `v1.0.0.0`
+## Benchmark: Official Driver vs. `oxidisplay` `v1.0.0.0`
 
-Measured head-to-head on **Wacom DTU-1031 (1280×800 @ 60 Hz)** using [`dl-bench`](crates/dl-probe/src/bin/dl-bench.rs) (18-second standardized 60 Hz D3D11 Flip-Model workload across 4 phases) and Windows kernel ETW (`Microsoft-Windows-IndirectDisplays-ClassExtension-Events`, Event ID 25):
+Measured head-to-head on **Wacom DTU-1031 (full-screen 1280×800 @ 60 Hz, Per-Monitor-V2 DPI-aware)** using [`dl-bench`](crates/dl-probe/src/bin/dl-bench.rs) (18-second standardized 60 Hz D3D11 Flip-Model workload across 4 phases) and Windows kernel ETW (`Microsoft-Windows-IndirectDisplays-ClassExtension-Events`, Event ID 25):
 
-| Metric | Official DisplayLink (`11.2.3146.0`) | Rust `v0.2.0.0` (Scalar + Single Staging) | **Rust `v1.0.0.0` (AVX2 + Ping-Pong)** | vs. Official |
-| --- | ---: | ---: | ---: | ---: |
-| **Total IddCx Frames (18s)** | 602 | 802 | **1,105** | **+83.6%** |
-| **Phase 1: Idle (0–3s)** | 32.2 FPS (`p50 30.8 ms`) | 60.0 FPS | **60.0 FPS (`p50 16.6 ms`)** | **+86%** |
-| **Phase 2: UI Scroll (3–8s)** | 34.4 FPS (`p50 30.8 ms`) | 36.0 FPS | **59.8 FPS (`p50 16.6 ms`)** | **+74%** |
-| **Phase 3: Video Box (8–13s)** | 32.3 FPS (`p50 31.3 ms`) | 38.8 FPS | **59.6 FPS (`p50 16.6 ms`)** | **+85%** |
-| **Phase 4: Full Motion (13–18s)** | 34.8 FPS (`p50 30.7 ms`) | 47.3 FPS | **60.2 FPS (`p50 16.6 ms`)** | **+73%** |
-| **USB Bulk Traffic (`IO Other`)** | 408.3 MB (`26.25 MB/s`) | 277.2 MB (`17.79 MB/s`) | **358.6 MB (`23.35 MB/s`)** | **-12% bytes** |
-| **USB IOCTL Rate** | 479 IOCTLs/s | — | **219 IOCTLs/s** | **-54% IOCTLs** |
-| **Driver Binary Size** | 10,820 KB | ~236 KB | **241 KB** | **-97.8%** |
-| **Host Working Set** | 71.7 MB | 46.0 MB | **50.3 MB** | **-30%** |
-| **Host Private Memory (Delta)** | 85.1 MB | 62.6 MB | **66.8 MB (`-1.5 MB`)** | **-21%** |
-| **Host Kernel Handles** | 729 | 499 | **503** | **-31%** |
-| **Driver Host CPU (12 logical CPUs)** | Avg 1.18% (1-core 14.1%) | Avg 1.50% | **Avg 1.89% (1-core 22.6%)** | +0.71% total |
+| Metric | Official DisplayLink (`11.2.3146.0`) | **`oxidisplay` `v1.0.0.0` (AVX2 + Ping-Pong)** | vs. Official |
+| --- | ---: | ---: | ---: |
+| **Total IddCx Frames (18s)** | 603 | **957** | **+58.7%** |
+| **Phase 1: Idle (0–3s)** | 32.2 FPS (`p50 31.2 ms`) | **56.7 FPS (`p50 16.7 ms`)** | **+76%** |
+| **Phase 2: UI Scroll (3–8s)** | 32.1 FPS (`p50 31.3 ms`) | **51.1 FPS (`p50 16.8 ms`)** | **+59%** |
+| **Phase 3: Video Box (8–13s)** | 32.3 FPS (`p50 31.2 ms`) | **51.3 FPS (`p50 16.8 ms`)** | **+59%** |
+| **Phase 4: Full Motion (13–18s)** | 32.1 FPS (`p50 31.1 ms`) | **47.9 FPS (`p50 16.8 ms`)** | **+49%** |
+| **Driver Host CPU (12 logical CPUs)** | Avg 1.35% (1-core: 16.2%) | **Avg 0.67% (1-core: 8.0%)** | **-50% CPU** |
+| **USB Bulk Traffic (`IO Other`)** | 407.3 MB (`26.16 MB/s`) | **323.0 MB (`20.73 MB/s`)** | **-21% bytes** |
+| **USB IOCTL Rate** | 477 IOCTLs/s | **196 IOCTLs/s** | **-59% IOCTLs** |
+| **Driver Binary Size** | 10,820 KB | **241 KB** | **-97.8%** |
+| **Host Working Set (Delta)** | 71.6 MB (`0.0 MB`) | **50.4 MB (`0.0 MB`)** | **-30%** |
+| **Host Private Memory (Delta)** | 85.3 MB (`0.0 MB`) | **67.1 MB (`0.0 MB`)** | **-21%** |
+| **Host Kernel Handles (Delta)** | 728 (`0`) | **503 (`0`)** | **-31%** |
 
-> **Why is CPU usage only ~1.9%?**  
+> **Why is CPU usage only ~0.67%?**  
 > On Windows, **DWM and applications still render on your GPU** (Direct3D / DXGI). The DisplayLink driver only reads back dirty regions, converts BGRA→RGB565/RLE using AVX2 SIMD (taking `0.07–0.93 ms` per frame for typical desktop/video frames), and streams Bulk URBs over USB.
 
 ---
@@ -133,13 +133,11 @@ To add another DL-1x5 USB 2.0 display (e.g. DL-125 / DL-165 / DL-195), add its H
 
 ## Running the ETW A/B Benchmark / ベンチマーク実行
 
-To measure real IddCx frame cadence, USB Bulk bandwidth, CPU usage, and memory/handle footprint on your monitor (Administrator PowerShell):
+To automatically locate the connected 1280×800 monitor (DPI-aware) and run the head-to-head A/B benchmark measuring real IddCx frame cadence, USB Bulk bandwidth, CPU usage, and memory/handle footprint (Administrator PowerShell):
 
 ```powershell
-.\scripts\run_ab_benchmark.ps1 -Label "rust_v1" -MonitorLeft 2560 -MonitorTop 0
+.\scripts\run_ab_benchmark.ps1
 ```
-
-Adjust `-MonitorLeft` / `-MonitorTop` to match your DisplayLink monitor's virtual desktop coordinates.
 
 ---
 

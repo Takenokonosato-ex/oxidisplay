@@ -139,7 +139,24 @@ extern "system" {
     fn TranslateMessage(lp_msg: *const MSG) -> BOOL;
     fn DispatchMessageW(lp_msg: *const MSG) -> isize;
     fn SetProcessDPIAware() -> BOOL;
+    fn SetProcessDpiAwarenessContext(value: isize) -> BOOL;
+    fn ShowWindow(hwnd: HWND, n_cmd_show: i32) -> BOOL;
+    fn SetWindowPos(
+        hwnd: HWND,
+        hwnd_insert_after: HWND,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        u_flags: u32,
+    ) -> BOOL;
 }
+
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+const HWND_TOPMOST: HWND = -1isize as HWND;
+const SW_SHOWNOACTIVATE: i32 = 4;
+const SWP_NOACTIVATE: u32 = 0x0010;
+const SWP_SHOWWINDOW: u32 = 0x0040;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -359,7 +376,9 @@ fn main() {
     let phase_secs: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     unsafe {
-        SetProcessDPIAware();
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+            SetProcessDPIAware();
+        }
         let hinst = GetModuleHandleW(core::ptr::null());
         let cls: Vec<u16> = "DlRustBenchWnd\0".encode_utf16().collect();
         let wc = WNDCLASSW {
@@ -391,6 +410,17 @@ fn main() {
             core::ptr::null_mut(),
         );
         assert!(!hwnd.is_null(), "CreateWindowExW failed");
+        // Explicitly enforce exact physical pixel coordinates on the target monitor.
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            mon_x,
+            mon_y,
+            w as i32,
+            h as i32,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         let sc_desc = DXGI_SWAP_CHAIN_DESC {
             buffer_desc: DXGI_MODE_DESC {

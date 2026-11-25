@@ -10,9 +10,9 @@
 #>
 $ErrorActionPreference = "Stop"
 
-Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 [StructLayout(LayoutKind.Sequential)]
@@ -29,6 +29,47 @@ public static class ProcIo {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool GetProcessIoCounters(IntPtr hProcess, out IO_COUNTERS lpIoCounters);
 }
+
+public class PhysicalMonitor {
+    public string DeviceName;
+    public int X, Y, Width, Height;
+}
+
+public static class DpiMonitors {
+    [DllImport("user32.dll")]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr val);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct MONITORINFOEX {
+        public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice;
+    }
+    private delegate bool MonEnumProc(IntPtr hMon, IntPtr hdc, ref RECT lprc, IntPtr dwData);
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprc, MonEnumProc proc, IntPtr dwData);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern bool GetMonitorInfo(IntPtr hMon, ref MONITORINFOEX lpmi);
+
+    public static List<PhysicalMonitor> EnumAll() {
+        SetProcessDpiAwarenessContext(new IntPtr(-4)); // PER_MONITOR_AWARE_V2
+        var list = new List<PhysicalMonitor>();
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr h, IntPtr hdc, ref RECT r, IntPtr d) => {
+            var mi = new MONITORINFOEX { cbSize = Marshal.SizeOf(typeof(MONITORINFOEX)) };
+            if (GetMonitorInfo(h, ref mi)) {
+                list.Add(new PhysicalMonitor {
+                    DeviceName = mi.szDevice,
+                    X = mi.rcMonitor.L,
+                    Y = mi.rcMonitor.T,
+                    Width = mi.rcMonitor.R - mi.rcMonitor.L,
+                    Height = mi.rcMonitor.B - mi.rcMonitor.T
+                });
+            }
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+}
 "@
 
 $Root = Split-Path -Parent $PSScriptRoot
@@ -39,8 +80,8 @@ $IddEtwGuid = "{966CD1C0-3F69-42AD-9877-517DCE8462B4}"
 
 function Find-DtuScreen {
     for ($i = 0; $i -lt 15; $i++) {
-        $scr = [System.Windows.Forms.Screen]::AllScreens | Where-Object {
-            $_.Bounds.Width -eq 1280 -and $_.Bounds.Height -eq 800
+        $scr = [DpiMonitors]::EnumAll() | Where-Object {
+            $_.Width -eq 1280 -and $_.Height -eq 800
         } | Select-Object -First 1
         if ($scr) { return $scr }
         Start-Sleep -Seconds 1
@@ -63,33 +104,46 @@ function Find-DisplayLinkWudfHost {
     throw "Could not locate WUDFHost hosting DisplayLink driver!"
 }
 
-function Summarize-IddEtw([string]$EtlPath, [int]$TargetPid, [double]$ActiveSeconds) {
-    if (-not (Test-Path $EtlPath)) { return "ETW file missing" }
+function Summarize-IddEtw([string]$EtlPath, [int]$TargetPid, [datetime]$StartTime) {
+    if (-not (Test-Path $EtlPath)) { return @("ETW file missing") }
     $events = Get-WinEvent -Path $EtlPath -Oldest -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -eq $TargetPid }
-    if (-not $events) { return "ETW: 0 events for PID $TargetPid" }
+    if (-not $events) { return @("ETW: 0 events for PID $TargetPid") }
     $groups = $events | Group-Object Id | Sort-Object Count -Descending
     $summary = ($groups | Select-Object -First 6 | ForEach-Object { "ID$($_.Name)=$($_.Count)" }) -join ", "
-    # Find the highest-frequency frame-event ID (ReleaseAndAcquire / FinishedProcessingFrame)
-    $topId = ($groups | Select-Object -First 1).Name
-    $topEvs = $events | Where-Object { $_.Id -eq $topId }
-    $frameTimes = New-Object System.Collections.Generic.List[double]
-    for ($i = 1; $i -lt $topEvs.Count; $i++) {
-        $dt = ($topEvs[$i].TimeCreated - $topEvs[$i-1].TimeCreated).TotalMilliseconds
-        if ($dt -gt 0.1 -and $dt -lt 500.0) { $frameTimes.Add($dt) }
+    $frameEvs = $events | Where-Object { $_.Id -eq 25 }
+    if (-not $frameEvs) { $frameEvs = $events | Where-Object { $_.Id -eq 26 } }
+    $outLines = @("ETW Events (PID $TargetPid): [$summary] | TotalIddFrames=$($frameEvs.Count)")
+    $phases = @(
+        @("Idle (0-3s)         ", 0.2, 2.9),
+        @("UI Scroll (3-8s)    ", 3.2, 7.9),
+        @("Video Box (8-13s)   ", 8.2, 12.9),
+        @("Full Motion (13-18s)", 13.2, 17.9)
+    )
+    foreach ($ph in $phases) {
+        $pName, $s0, $s1 = $ph
+        $sub = @($frameEvs | Where-Object {
+            $t = ($_.TimeCreated - $StartTime).TotalSeconds
+            $t -ge $s0 -and $t -le $s1
+        })
+        $dur = $s1 - $s0
+        $fps = $sub.Count / $dur
+        $dts = New-Object System.Collections.Generic.List[double]
+        for ($i = 1; $i -lt $sub.Count; $i++) {
+            $dt = ($sub[$i].TimeCreated - $sub[$i-1].TimeCreated).TotalMilliseconds
+            if ($dt -gt 0.1 -and $dt -lt 1000.0) { $dts.Add($dt) }
+        }
+        if ($dts.Count -gt 2) {
+            $sorted = $dts | Sort-Object
+            $n = $sorted.Count
+            $p50 = $sorted[[int]($n * 0.50)]
+            $p95 = $sorted[[int]($n * 0.95)]
+            $max = $sorted[$n - 1]
+            $outLines += ("    {0}: {1,5:F1} FPS ({2,3} frames) | p50={3,5:F1}ms  p95={4,5:F1}ms  max={5,5:F1}ms" -f $pName, $fps, $sub.Count, $p50, $p95, $max)
+        } else {
+            $outLines += ("    {0}: {1,5:F1} FPS ({2,3} frames)" -f $pName, $fps, $sub.Count)
+        }
     }
-    $fpsStr = ""
-    if ($frameTimes.Count -gt 10) {
-        $sorted = $frameTimes | Sort-Object
-        $n = $sorted.Count
-        $p50 = $sorted[[int]($n * 0.50)]
-        $p95 = $sorted[[int]($n * 0.95)]
-        $p99 = $sorted[[int]($n * 0.99)]
-        $max = $sorted[$n - 1]
-        $avgMs = ($frameTimes | Measure-Object -Average).Average
-        $realFps = if ($ActiveSeconds -gt 0) { $topEvs.Count / $ActiveSeconds } else { 0 }
-        $fpsStr = (" | RealIddCx(ID{0}): count={1}, avg_fps={2:F1} (active {3:F1}s), avg={4:F2}ms, p50={5:F2}ms, p95={6:F2}ms, p99={7:F2}ms, max={8:F2}ms" -f $topId, $topEvs.Count, $realFps, $ActiveSeconds, $avgMs, $p50, $p95, $p99, $max)
-    }
-    return "ETW Events (PID $TargetPid): [$summary]$fpsStr"
+    return $outLines
 }
 
 function Measure-DriverRun([string]$Label, [string]$Tag) {
@@ -116,7 +170,7 @@ function Measure-DriverRun([string]$Label, [string]$Tag) {
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $BenchExe
-    $psi.Arguments = "$($scr.Bounds.X) $($scr.Bounds.Y) $($scr.Bounds.Width) $($scr.Bounds.Height) 5"
+    $psi.Arguments = "$($scr.X) $($scr.Y) $($scr.Width) $($scr.Height) 5"
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
@@ -166,20 +220,20 @@ function Measure-DriverRun([string]$Label, [string]$Tag) {
     $usbOtherMB = ($io1.OtherTransferCount - $io0.OtherTransferCount) / 1MB
     $usbOtherMBps = $usbOtherMB / $activeSec
     $usbOtherOps = ($io1.OtherOperationCount - $io0.OtherOperationCount) / $activeSec
-    $etwLine = Summarize-IddEtw $etlPath $proc.Id $activeSec
+    $etwLines = Summarize-IddEtw $etlPath $proc.Id $t0
 
     $lines = @()
     $lines += "================================================================"
     $lines += "BENCHMARK: $Label"
     $lines += "  DLL:        $($hostInfo.Module) ($dllSizeKB KB on disk, ver=$ver)"
-    $lines += "  Screen:     $($scr.DeviceName) $($scr.Bounds.X),$($scr.Bounds.Y) $($scr.Bounds.Width)x$($scr.Bounds.Height)"
+    $lines += "  Screen:     $($scr.DeviceName) $($scr.X),$($scr.Y) $($scr.Width)x$($scr.Height)"
     $lines += "  WUDFHost:   PID=$($proc.Id)"
     $lines += ("  CPU Usage:  Avg={0:F2}% (1-core eq: {1:F1}%) | Peak={2:F2}% ({3} logical CPUs)" -f $avgCpuTotal, $avgCpuOneCore, $peakCpuPct, $cores)
     $lines += ("  WorkingSet: Start={0:F1} MB -> End={1:F1} MB (Peak={2:F1} MB, Delta={3:+0.0;-0.0;0.0} MB)" -f ($ws0/1MB), ($ws1/1MB), ($peakWs/1MB), (($ws1-$ws0)/1MB))
     $lines += ("  PrivateMem: Start={0:F1} MB -> End={1:F1} MB (Peak={2:F1} MB, Delta={3:+0.0;-0.0;0.0} MB)" -f ($priv0/1MB), ($priv1/1MB), ($peakPriv/1MB), (($priv1-$priv0)/1MB))
     $lines += ("  Handles:    Start={0} -> End={1} (Delta={2:+0;-0;0})" -f $hdl0, $hdl1, ($hdl1 - $hdl0))
     $lines += ("  USB IOCTL:  Total={0:F1} MB | ActiveAvg={1:F2} MB/s | IOCTLs={2:F0} ops/s" -f $usbOtherMB, $usbOtherMBps, $usbOtherOps)
-    $lines += "  $etwLine"
+    foreach ($el in $etwLines) { $lines += "  $el" }
     $lines += "  --- Client 60Hz Workload Phases ---"
     foreach ($l in ($benchOut -split "`r?`n")) {
         if ($l.Trim()) { $lines += "  $l" }
@@ -189,10 +243,10 @@ function Measure-DriverRun([string]$Label, [string]$Tag) {
 
 $allLines = @()
 
-Write-Host "[1/4] Benchmarking Rust Driver (v0.2.0.0)..." -ForegroundColor Cyan
-$allLines += Measure-DriverRun "Rust Driver (dl_rust_idd v0.2.0.0)" "rust"
+Write-Host "[1/4] Benchmarking oxidisplay Rust Driver (v1.0.0.0)..." -ForegroundColor Cyan
+$allLines += Measure-DriverRun "oxidisplay Rust Driver (dl_rust_idd v1.0.0.0)" "rust"
 
-Write-Host "[2/4] Switching to Official DisplayLink Driver (DriverStore)..." -ForegroundColor Yellow
+Write-Host "[2/4] Switching to Official DisplayLink Driver..." -ForegroundColor Yellow
 $drivers = pnputil /enum-drivers | Out-String
 foreach ($b in ($drivers -split "\r?\n\r?\n")) {
     if ($b -match "dl_rust_idd\.inf" -and $b -match "Published Name\s*:\s*(oem\d+\.inf)") {
@@ -205,7 +259,7 @@ Start-Sleep -Seconds 5
 Write-Host "[3/4] Benchmarking Official DisplayLink Driver (11.2.3146.0)..." -ForegroundColor Cyan
 $allLines += Measure-DriverRun "Official DisplayLink Driver (dlidusb4 11.2.3146.0)" "official"
 
-Write-Host "[4/4] Restoring Rust Driver (v0.2.0.0)..." -ForegroundColor Green
+Write-Host "[4/4] Restoring oxidisplay Rust Driver (v1.0.0.0)..." -ForegroundColor Green
 pnputil /add-driver "$RustInf" /install | Out-Null
 $dev = Get-PnpDevice | Where-Object { $_.InstanceId -match 'USB\\VID_17E9&PID_04A3' } | Select-Object -First 1
 if ($dev) {
