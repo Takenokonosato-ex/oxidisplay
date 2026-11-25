@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Packaged / signed driver outputs & local test certificates (never commit private certs!)
+/dist/
+*.cat
+*.cer
+*.pfx
+*.pvk
+*.spc
+*.pdb
+*.etl
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

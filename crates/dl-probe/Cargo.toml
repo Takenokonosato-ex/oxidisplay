@@ -1,0 +1,9 @@
+[package]
+name = "dl-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DisplayLink DL-1x5 EDID/timing inspector and 60 FPS encoder benchmark tool"
+
+[dependencies]
+dl-protocol = { path = "../dl-protocol" }

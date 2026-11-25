@@ -1,0 +1,8 @@
+[package]
+name = "dl-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room Rust implementation of the DisplayLink DL-1x5 USB graphics protocol"
+
+[dependencies]

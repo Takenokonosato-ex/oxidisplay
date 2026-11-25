@@ -1,0 +1,76 @@
+;
+; Installation INF for oxidisplay (UMDF 2.33 + IddCx 1.10 driver for DisplayLink DL-1x5)
+; Target Hardware: Wacom DTU-1031 (USB\VID_17E9&PID_04A3)
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+ClassVer    = 2.0
+Provider    = %ManufacturerName%
+CatalogFile = dl_rust_idd.cat
+DriverVer   = 11/26/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard, NTamd64.10.0...22621
+
+[Standard.NTamd64.10.0...22621]
+%DeviceName% = DlRustIdd_Install, USB\VID_17E9&PID_04A3
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+dl_rust_idd.dll = 1
+
+[DestinationDirs]
+UMDriverCopy = 12,UMDF ; %SystemRoot%\System32\drivers\UMDF
+
+[UMDriverCopy]
+dl_rust_idd.dll
+
+; =================== UMDF 2.33 + IddCx 1.10 Device ===========================
+
+[DlRustIdd_Install.NT]
+CopyFiles = UMDriverCopy
+
+[DlRustIdd_Install.NT.hw]
+AddReg = DlRustIdd_AddReg
+
+[DlRustIdd_Install.NT.Services]
+AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[DlRustIdd_Install.NT.Wdf]
+UmdfDispatcher               = NativeUSB
+UmdfService                  = DlRustIdd, DlRustIdd_Service
+UmdfServiceOrder             = DlRustIdd
+UmdfKernelModeClientPolicy   = AllowKernelModeClients
+UmdfMethodNeitherAction      = Copy
+UmdfFileObjectPolicy         = AllowNullAndUnknownFileObjects
+
+[DlRustIdd_Service]
+UmdfLibraryVersion = 2.33.0
+ServiceBinary      = %12%\UMDF\dl_rust_idd.dll
+UmdfExtensions     = IddCx0102
+
+[DlRustIdd_AddReg]
+HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",0x00000000,"DlRustDevices"
+HKR,,"Security",,"D:P(A;;GA;;;SY)(A;;GRGW;;;BA)(A;;GRGW;;;WD)"
+HKR,"WDF","WdfDirectedPowerTransitionEnable",0x00010001,1
+
+[WUDFRD_ServiceInstall]
+DisplayName   = %WudfRdDisplayName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[Strings]
+ManufacturerName  = "oxidisplay Contributors"
+DiskName          = "oxidisplay DL-1x5 Driver Disk"
+DeviceName        = "oxidisplay DL-1x5 Indirect Display (DTU-1031)"
+WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"
+REG_MULTI_SZ      = 0x00010000

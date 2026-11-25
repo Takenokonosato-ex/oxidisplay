@@ -1,0 +1,13 @@
+[package]
+name = "dl-idd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Windows UMDF 2 + IddCx 1.10 Indirect Display Driver for DisplayLink DL-1x5 written from scratch in Rust"
+
+[lib]
+name = "dl_rust_idd"
+crate-type = ["cdylib"]
+
+[dependencies]
+dl-protocol = { path = "../dl-protocol" }
