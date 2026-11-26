@@ -439,8 +439,12 @@ impl UsbTransport {
     }
 
     /// Reset Bulk OUT pipe after a transient USB error and re-select standard channel.
+    /// Per WDF requirements, stops the I/O target to cancel any hung URBs before resetting the pipe.
     pub fn recover_pipe(&mut self) -> bool {
-        self.wait_all_in_flight(Duration::from_secs(1));
+        unsafe {
+            wdf_io_target_stop(self.bulk_out_pipe, WDF_IO_TARGET_CANCEL_SENT_IO);
+        }
+        self.wait_all_in_flight(Duration::from_secs(2));
         let mut opts = WDF_REQUEST_SEND_OPTIONS {
             size: size_of::<WDF_REQUEST_SEND_OPTIONS>() as u32,
             flags: WDF_REQUEST_SEND_OPTION_TIMEOUT,
@@ -453,6 +457,9 @@ impl UsbTransport {
                 &mut opts,
             )
         };
+        unsafe {
+            let _ = wdf_io_target_start(self.bulk_out_pipe);
+        }
         if nt_success(st) {
             self.pool.io_error_seen.store(false, Ordering::Release);
             let _ = self.select_std_channel();
@@ -642,10 +649,15 @@ impl<'a> ChunkSink for AsyncUsbSink<'a> {
                     .store(guard.in_flight, Ordering::Relaxed);
             }
 
+            let mut send_opts = WDF_REQUEST_SEND_OPTIONS {
+                size: size_of::<WDF_REQUEST_SEND_OPTIONS>() as u32,
+                flags: WDF_REQUEST_SEND_OPTION_TIMEOUT,
+                timeout: USB_TIMEOUT_2S,
+            };
             let sent = wdf_request_send(
                 slot.request,
                 self.transport.bulk_out_pipe,
-                core::ptr::null_mut(),
+                &mut send_opts,
             );
             if sent == 0 {
                 {

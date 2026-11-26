@@ -243,8 +243,8 @@ function Measure-DriverRun([string]$Label, [string]$Tag) {
 
 $allLines = @()
 
-Write-Host "[1/4] Benchmarking oxidisplay Rust Driver (v1.1.0.0)..." -ForegroundColor Cyan
-$allLines += Measure-DriverRun "oxidisplay Rust Driver (dl_rust_idd v1.1.0.0)" "rust"
+Write-Host "[1/4] Benchmarking oxidisplay Rust Driver (v1.1.1.0)..." -ForegroundColor Cyan
+$allLines += Measure-DriverRun "oxidisplay Rust Driver (dl_rust_idd v1.1.1.0)" "rust"
 
 Write-Host "[2/4] Switching to Official DisplayLink Driver..." -ForegroundColor Yellow
 $drivers = pnputil /enum-drivers | Out-String
@@ -259,7 +259,7 @@ Start-Sleep -Seconds 5
 Write-Host "[3/4] Benchmarking Official DisplayLink Driver (11.2.3146.0)..." -ForegroundColor Cyan
 $allLines += Measure-DriverRun "Official DisplayLink Driver (dlidusb4 11.2.3146.0)" "official"
 
-Write-Host "[4/4] Restoring oxidisplay Rust Driver (v1.1.0.0)..." -ForegroundColor Green
+Write-Host "[4/4] Restoring oxidisplay Rust Driver (v1.1.1.0)..." -ForegroundColor Green
 pnputil /add-driver "$RustInf" /install | Out-Null
 $dev = Get-PnpDevice | Where-Object { $_.InstanceId -match 'USB\\VID_17E9&PID_04A3' } | Select-Object -First 1
 if ($dev) {

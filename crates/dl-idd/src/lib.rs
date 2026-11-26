@@ -106,8 +106,17 @@ fn registry() -> &'static Mutex<DriverRegistry> {
 }
 
 fn fill_video_signal_info(mode: &VideoMode, is_target_mode: bool) -> DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-    let (h_num, h_den) = mode.hsync_freq();
-    let (v_num, v_den) = mode.vsync_freq();
+    // CRITICAL: Report a small-numerator reduced integer refresh rate (e.g. 60/1) to IddCx!
+    // Windows `IndirectKmd.sys` / `dxgkrnl.sys` multiplies 64-bit `QPC * vSyncFreq.Numerator`
+    // internally when computing `FramePresentQpcTime`. Passing a raw pixel-clock numerator like
+    // `71_110_000 / 1_185_120` overflows signed/unsigned 64-bit QPC after just 3.6–7.2 hours
+    // of system uptime, jumping `FramePresentQpcTime` years into the future and locking DWM
+    // onto its 2,000 ms (0.5 FPS) fallback timer! With `60 / 1`, 64-bit QPC lasts 487 years.
+    // (The actual DL-1x5 hardware modeset still programs the exact EDID 71.11 MHz timing.)
+    let v_hz = ((mode.refresh_mhz() + 500) / 1000).max(1);
+    let h_hz = v_hz.saturating_mul(mode.vtotal as u32).max(1);
+    let pixel_rate = (h_hz as u64).saturating_mul(mode.htotal as u64);
+
     // IddCx rule:
     // - videoStandard (bits 0..16) = D3DKMDT_VSS_OTHER (255)
     // - vSyncFreqDivider (bits 16..22):
@@ -120,14 +129,14 @@ fn fill_video_signal_info(mode: &VideoMode, is_target_mode: bool) -> DISPLAYCONF
     };
 
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-        pixel_rate: mode.pixel_rate_hz(),
+        pixel_rate,
         h_sync_freq: DISPLAYCONFIG_RATIONAL {
-            numerator: h_num,
-            denominator: h_den,
+            numerator: h_hz,
+            denominator: 1,
         },
         v_sync_freq: DISPLAYCONFIG_RATIONAL {
-            numerator: v_num,
-            denominator: v_den,
+            numerator: v_hz,
+            denominator: 1,
         },
         active_size: DISPLAYCONFIG_2DREGION {
             cx: mode.hdisplay as u32,
